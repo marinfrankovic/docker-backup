@@ -1009,7 +1009,12 @@ async function loadLogs(){
 window.addEventListener("beforeunload",e=>{if(schAnyDirty()){e.preventDefault();e.returnValue=""}});
 setInterval(()=>{const n=new Date();const p=x=>String(x).padStart(2,"0");
   $("#clock").textContent=p(n.getDate())+"."+p(n.getMonth()+1)+"."+n.getFullYear()+" "+p(n.getHours())+":"+p(n.getMinutes())+":"+p(n.getSeconds())},1000);
-setInterval(async()=>{try{setStatus(await api("/api/state"))}catch(e){}},4000);
+let _wasBusy=false;
+setInterval(async()=>{try{const s=await api("/api/state");setStatus(s);
+  // when a backup/restore finishes, refresh the Restore list in the background
+  if(_wasBusy&&!s.busy){renderRuns(s.runs);}
+  _wasBusy=!!s.busy;
+}catch(e){}},4000);
 setInterval(()=>{if($("#autoLog")?.checked && !$("#tab-logs").classList.contains("hidden"))loadLogs()},5000);
 refresh();
 </script>

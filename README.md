@@ -86,7 +86,9 @@ Five tabs:
   captured. Expand a run to restore a single project or the **whole run**
   end-to-end, or delete a run. **You don't import anything:** if you mount a root
   folder that already contains older backups, they are discovered and listed
-  automatically the moment the tool starts.
+  automatically the moment the tool starts. The list **auto-refreshes in the
+  background** as soon as a backup finishes, so newly completed runs appear
+  without reloading the page.
 - **Schedules** — add/remove schedules. Each tile is collapsed by default with a
   summary in its header; expand one to edit it. Containers are grouped by project
   (toggle a whole project or individual containers). Each schedule has a name,
