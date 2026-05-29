@@ -647,6 +647,7 @@ summary{cursor:pointer;font-weight:600}details{margin:6px 0}
 tr.grp td{background:var(--panel2);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
 tr.grp b{font-size:13px}tr.member td{background:transparent}
 .caret{display:inline-block;width:16px;text-align:center;cursor:pointer;color:var(--muted);user-select:none;margin-right:4px}
+.stackName{cursor:pointer;user-select:none}.stackName:hover{text-decoration:underline}
 .sched{border:1px solid var(--line);border-radius:9px;padding:14px;margin-bottom:12px;background:var(--panel2)}
 .sched .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-top:10px}
 .sched .fld{display:flex;flex-direction:column;gap:4px}
@@ -782,9 +783,9 @@ function renderContainers(){
     const label=proj==="_standalone"?"(standalone)":proj;
     const gid="g_"+proj.replace(/[^A-Za-z0-9]/g,"_");
     const gh=document.createElement("tr");gh.className="grp";
-    gh.innerHTML=`<td><input type=checkbox title="Select stack" onclick="toggleGroup('${gid}',this)"></td>
+    gh.innerHTML=`<td><input type=checkbox id="${gid}_cb" title="Select stack" onclick="toggleGroup('${gid}',this)"></td>
       <td colspan=4><span class=caret onclick="toggleCollapse('${gid}',this)">\u25b8</span>
-        <b>\uD83D\uDCE6 ${esc(label)}</b>
+        <b class=stackName title="Select all containers in this stack" onclick="selectStack('${gid}')">\uD83D\uDCE6 ${esc(label)}</b>
         <span class=tag>&nbsp;${list.length} container${list.length>1?"s":""} \u00b7 ${running} running</span></td>
       <td class=right><button class="btn sm" onclick="backupProject('${esc(proj)}')">Back up stack</button></td>`;
     tb.appendChild(gh);
@@ -801,6 +802,7 @@ function renderContainers(){
 }
 function toggleAll(cb){$$(".csel").forEach(x=>x.checked=cb.checked)}
 function toggleGroup(gid,cb){$$(".csel."+gid).forEach(x=>x.checked=cb.checked)}
+function selectStack(gid){const boxes=$$(".csel."+gid);const all=boxes.length&&[...boxes].every(x=>x.checked);boxes.forEach(x=>x.checked=!all);const cb=$("#"+gid+"_cb");if(cb)cb.checked=!all}
 function toggleCollapse(gid,el){const hide=el.textContent==="\u25be";$$("tr.member."+gid).forEach(r=>r.classList.toggle("hidden",hide));el.textContent=hide?"\u25b8":"\u25be"}
 function backupProject(proj){const names=CT.filter(c=>c.project===proj).map(c=>c.name);if(!names.length)return;backup(names)}
 function selected(){return $$(".csel").filter(x=>x.checked).map(x=>x.value)}

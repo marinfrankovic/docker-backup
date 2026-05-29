@@ -75,8 +75,9 @@ corner shows the current local date and time (`DD.MM.YYYY` with 24-hour clock).
 Five tabs:
 
 - **Backup** — live list of all containers (any state). Back up selected ones,
-  one container, a whole stack, or all running containers with a click. Manual
-  backups land in the `_manual` bucket.
+  one container, a whole stack, or all running containers with a click. Click a
+  stack's name (📦) to select/deselect all containers in that stack at once.
+  Manual backups land in the `_manual` bucket.
 - **Restore** — lists every completed backup run found under the root, **grouped
   by run date** (`DD.MM.YYYY`, newest day first; today's date is expanded, older
   days collapsed). Each run shows its start time and bucket, and every project
