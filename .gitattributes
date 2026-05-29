@@ -1,0 +1,9 @@
+# Force LF for files that run inside the Linux container (BusyBox sh / python3).
+*.sh   text eol=lf
+app.py text eol=lf
+
+# Normalize other text files, but keep them LF to avoid CRLF surprises.
+*.md   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+Dockerfile text eol=lf

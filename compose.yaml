@@ -1,0 +1,23 @@
+name: docker-backup
+
+services:
+  docker-backup:
+    build: .
+    image: docker-backup:local
+    container_name: docker-backup
+    hostname: docker-backup
+    restart: unless-stopped          # always-on; auto-starts with Docker Desktop
+    environment:
+      TZ: Europe/Zagreb              # local time for the schedule
+      BACKUP_HOUR: "3"               # default daily time (used until set in the GUI)
+      RETENTION_DAYS: "7"            # default retention (editable in the GUI)
+      BACKUP_ROOT_CONTAINER: /backups
+      BACKUP_ROOT_HOST: "E:/Docker/backups"   # host path (used for sibling helper mounts)
+      HELPER_IMAGE: alpine:3.20
+      SELF_NAME: docker-backup
+      GUI_PORT: "8088"
+    ports:
+      - "127.0.0.1:8088:8088"         # web GUI, bound to localhost only
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock   # discover/exec all containers
+      - "E:/Docker/backups:/backups"                # backup destination on disk

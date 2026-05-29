@@ -1,0 +1,23 @@
+# Runtime / local artifacts — never committed
+backups/
+_backups/
+_logs/
+_config/
+*.log
+*.tar.gz
+*.sql
+*.sql.gz
+
+# Secrets / credentials
+AuthData
+AuthData/
+*.env
+.env
+*.pem
+*.key
+
+# OS / editor noise
+Thumbs.db
+.DS_Store
+desktop.ini
+.vscode/
