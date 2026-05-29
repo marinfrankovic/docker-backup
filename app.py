@@ -783,7 +783,7 @@ function renderContainers(){
     const label=proj==="_standalone"?"(standalone)":proj;
     const gid="g_"+proj.replace(/[^A-Za-z0-9]/g,"_");
     const gh=document.createElement("tr");gh.className="grp";
-    gh.innerHTML=`<td><input type=checkbox id="${gid}_cb" title="Select stack" onclick="toggleGroup('${gid}',this)"></td>
+    gh.innerHTML=`<td><input type=checkbox id="${gid}_cb" data-gid="${gid}" title="Select stack" onclick="toggleGroup('${gid}',this)"></td>
       <td colspan=4><span class=caret onclick="toggleCollapse('${gid}',this)">\u25b8</span>
         <b class=stackName title="Select all containers in this stack" onclick="selectStack('${gid}')">\uD83D\uDCE6 ${esc(label)}</b>
         <span class=tag>&nbsp;${list.length} container${list.length>1?"s":""} \u00b7 ${running} running</span></td>
@@ -791,7 +791,7 @@ function renderContainers(){
     tb.appendChild(gh);
     list.forEach(c=>{
       const tr=document.createElement("tr");tr.className="member hidden "+gid;
-      tr.innerHTML=`<td style="padding-left:30px"><input type=checkbox class="csel ${gid}" value="${esc(c.name)}"></td>
+      tr.innerHTML=`<td style="padding-left:30px"><input type=checkbox class="csel ${gid}" value="${esc(c.name)}" onchange="syncStates()"></td>
         <td><b>${esc(c.name)}</b></td><td class=muted>${esc(c.project)}</td>
         <td class=tag>${esc(c.image)}</td>
         <td><span class="dot ${c.state}"></span>${c.state}</td>
@@ -800,9 +800,19 @@ function renderContainers(){
     });
   });
 }
-function toggleAll(cb){$$(".csel").forEach(x=>x.checked=cb.checked)}
-function toggleGroup(gid,cb){$$(".csel."+gid).forEach(x=>x.checked=cb.checked)}
-function selectStack(gid){const boxes=$$(".csel."+gid);const all=boxes.length&&[...boxes].every(x=>x.checked);boxes.forEach(x=>x.checked=!all);const cb=$("#"+gid+"_cb");if(cb)cb.checked=!all}
+function toggleAll(cb){$$(".csel").forEach(x=>x.checked=cb.checked);syncStates()}
+function toggleGroup(gid,cb){$$(".csel."+gid).forEach(x=>x.checked=cb.checked);syncStates()}
+function selectStack(gid){const boxes=$$(".csel."+gid);const all=boxes.length&&[...boxes].every(x=>x.checked);boxes.forEach(x=>x.checked=!all);syncStates()}
+function syncStates(){
+  // each stack checkbox reflects whether all its containers are selected
+  $$("[data-gid]").forEach(cb=>{
+    const boxes=$$(".csel."+cb.dataset.gid);
+    cb.checked=boxes.length>0&&[...boxes].every(x=>x.checked);
+  });
+  // top "select all" reflects whether every container is selected
+  const all=$$(".csel"),sel=$("#selAll");
+  if(sel)sel.checked=all.length>0&&[...all].every(x=>x.checked);
+}
 function toggleCollapse(gid,el){const hide=el.textContent==="\u25be";$$("tr.member."+gid).forEach(r=>r.classList.toggle("hidden",hide));el.textContent=hide?"\u25b8":"\u25be"}
 function backupProject(proj){const names=CT.filter(c=>c.project===proj).map(c=>c.name);if(!names.length)return;backup(names)}
 function selected(){return $$(".csel").filter(x=>x.checked).map(x=>x.value)}
