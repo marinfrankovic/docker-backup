@@ -77,11 +77,15 @@ Five tabs:
 - **Backup** — live list of all containers (any state). Back up selected ones,
   one container, a whole stack, or all running containers with a click. Manual
   backups land in the `_manual` bucket.
-- **Restore** — lists every completed backup run found under the root (newest
-  first), each collapsed by default; expand one to restore a single project or
-  the **whole run** end-to-end, or delete a run. **You don't import anything:**
-  if you mount a root folder that already contains older backups, they are
-  discovered and listed automatically the moment the tool starts.
+- **Restore** — lists every completed backup run found under the root, **grouped
+  by run date** (`DD.MM.YYYY`, newest day first; today's date is expanded, older
+  days collapsed). Each run shows its start time and bucket, and every project
+  inside a run shows its **own exact backup time** (`HH:MM:SS`) — so when several
+  schedules run on the same day you can see precisely when each project was
+  captured. Expand a run to restore a single project or the **whole run**
+  end-to-end, or delete a run. **You don't import anything:** if you mount a root
+  folder that already contains older backups, they are discovered and listed
+  automatically the moment the tool starts.
 - **Schedules** — add/remove schedules. Each tile is collapsed by default with a
   summary in its header; expand one to edit it. Containers are grouped by project
   (toggle a whole project or individual containers). Each schedule has a name,

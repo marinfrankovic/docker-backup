@@ -306,8 +306,12 @@ def _run_projects(run_abs):
             continue
         containers = sorted(c for c in os.listdir(ppath)
                             if os.path.isdir(os.path.join(ppath, c)))
+        try:
+            pmtime = os.path.getmtime(ppath)
+        except OSError:
+            pmtime = 0
         projects.append({"name": proj, "containers": containers,
-                         "size": dir_size(ppath)})
+                         "size": dir_size(ppath), "mtime": pmtime})
     return projects
 
 
@@ -638,6 +642,8 @@ padding:12px 16px;border-radius:9px;box-shadow:0 6px 24px rgba(0,0,0,.4);max-wid
 transition:opacity .2s;z-index:20}.toast.show{opacity:1}
 .tag{font-size:11px;color:var(--muted)}.hidden{display:none}
 summary{cursor:pointer;font-weight:600}details{margin:6px 0}
+.dayGroup>summary.daySummary{font-size:15px;padding:8px 4px;border-bottom:2px solid var(--line);margin-bottom:4px}
+.dayGroup>details{margin-left:14px}
 tr.grp td{background:var(--panel2);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
 tr.grp b{font-size:13px}tr.member td{background:transparent}
 .caret{display:inline-block;width:16px;text-align:center;cursor:pointer;color:var(--muted);user-select:none;margin-right:4px}
@@ -750,6 +756,9 @@ function schDirty(s){return SCH_BASELINE[s.id]!==JSON.stringify(s)}
 function schAnyDirty(){return SCHEDS.some(schDirty)}
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
 function fmtSize(b){if(!b)return"0 B";const u=["B","KB","MB","GB","TB"];let i=0;while(b>=1024&&i<u.length-1){b/=1024;i++}return b.toFixed(b<10&&i>0?1:0)+" "+u[i]}
+function _p2(x){return String(x).padStart(2,"0")}
+function fmtDate(ts){const n=new Date(ts*1000);return _p2(n.getDate())+"."+_p2(n.getMonth()+1)+"."+n.getFullYear()}
+function fmtTime(ts){const n=new Date(ts*1000);return _p2(n.getHours())+":"+_p2(n.getMinutes())+":"+_p2(n.getSeconds())}
 function toast(m){const t=$("#toast");t.textContent=m;t.classList.add("show");clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove("show"),3500)}
 async function api(path,opts){const r=await fetch(path,opts);let j={};try{j=await r.json()}catch(e){}if(!r.ok)throw new Error(j.error||j.message||r.status);return j}
 
@@ -809,20 +818,42 @@ const backupOne=n=>backup([n]);
 function renderRuns(runs){
   const el=$("#runs");el.innerHTML="";
   if(!runs.length){el.innerHTML='<p class=muted>No backup runs found under the root yet.</p>';return}
-  runs.forEach((r,i)=>{
-    const det=document.createElement("details");
-    const when=r.mtime?new Date(r.mtime*1000).toLocaleString():"";
-    const rows=r.projects.map(p=>`<tr>
-      <td><b>${esc(p.name)}</b><div class=tag>${esc(p.containers.join(", "))}</div></td>
-      <td>${fmtSize(p.size)}</td>
-      <td class=right>
-        <button class="btn sm" onclick="restore('${esc(r.run)}','${esc(p.name)}')">Restore project</button>
-      </td></tr>`).join("");
-    det.innerHTML=`<summary>${esc(r.label)} &nbsp;<span class=tag>${fmtSize(r.size)} · ${when}</span>
-      <button class="btn sm" style="margin-left:10px" onclick="event.preventDefault();restore('${esc(r.run)}',null)">Restore whole run</button>
-      <button class="btn sec sm danger" style="margin-left:6px" onclick="event.preventDefault();del('${esc(r.run)}')">Delete</button></summary>
-      <table style="margin-top:8px">${rows||'<tr><td class=muted>empty</td></tr>'}</table>`;
-    el.appendChild(det);
+  // group runs by calendar date (DD.MM.YYYY), newest day first
+  const days=[];const dayMap={};
+  runs.forEach(r=>{const d=fmtDate(r.mtime||0);
+    if(!dayMap[d]){dayMap[d]={date:d,mtime:r.mtime||0,runs:[]};days.push(dayMap[d])}
+    dayMap[d].runs.push(r);
+    if((r.mtime||0)>dayMap[d].mtime)dayMap[d].mtime=r.mtime||0;
+  });
+  days.sort((a,b)=>b.mtime-a.mtime);
+  const today=fmtDate(Date.now()/1000);
+  days.forEach(day=>{
+    const dayWrap=document.createElement("details");
+    dayWrap.className="dayGroup";
+    dayWrap.open=(day.date===today);
+    const dayBytes=day.runs.reduce((s,r)=>s+(r.size||0),0);
+    const nRuns=day.runs.length;
+    const head=document.createElement("summary");
+    head.className="daySummary";
+    head.innerHTML=`<b>${esc(day.date)}</b> <span class=tag>${nRuns} ${nRuns===1?"run":"runs"} · ${fmtSize(dayBytes)}</span>`;
+    dayWrap.appendChild(head);
+    day.runs.forEach(r=>{
+      const det=document.createElement("details");
+      const rows=r.projects.map(p=>`<tr>
+        <td><b>${esc(p.name)}</b><div class=tag>${esc(p.containers.join(", "))}</div></td>
+        <td class=tag>${p.mtime?fmtTime(p.mtime):""}</td>
+        <td>${fmtSize(p.size)}</td>
+        <td class=right>
+          <button class="btn sm" onclick="restore('${esc(r.run)}','${esc(p.name)}')">Restore project</button>
+        </td></tr>`).join("");
+      det.innerHTML=`<summary><span class=tag>${r.mtime?fmtTime(r.mtime):""}</span> &nbsp;${esc(r.label)}
+        <span class=tag>${fmtSize(r.size)}</span>
+        <button class="btn sm" style="margin-left:10px" onclick="event.preventDefault();restore('${esc(r.run)}',null)">Restore whole run</button>
+        <button class="btn sec sm danger" style="margin-left:6px" onclick="event.preventDefault();del('${esc(r.run)}')">Delete</button></summary>
+        <table style="margin-top:8px">${rows||'<tr><td class=muted>empty</td></tr>'}</table>`;
+      dayWrap.appendChild(det);
+    });
+    el.appendChild(dayWrap);
   });
 }
 async function restore(run,project){
