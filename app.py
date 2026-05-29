@@ -964,7 +964,8 @@ async function loadLogs(){
   }catch(e){}
 }
 window.addEventListener("beforeunload",e=>{if(schAnyDirty()){e.preventDefault();e.returnValue=""}});
-setInterval(()=>{$("#clock").textContent=new Date().toLocaleTimeString()},1000);
+setInterval(()=>{const n=new Date();const p=x=>String(x).padStart(2,"0");
+  $("#clock").textContent=p(n.getDate())+"."+p(n.getMonth()+1)+"."+n.getFullYear()+" "+p(n.getHours())+":"+p(n.getMinutes())+":"+p(n.getSeconds())},1000);
 setInterval(async()=>{try{setStatus(await api("/api/state"))}catch(e){}},4000);
 setInterval(()=>{if($("#autoLog")?.checked && !$("#tab-logs").classList.contains("hidden"))loadLogs()},5000);
 refresh();

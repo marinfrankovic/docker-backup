@@ -70,7 +70,9 @@ Use this the **first time** you set the tool up on a machine.
 
 ## Web GUI
 
-Open **http://127.0.0.1:8088** after the container is running. Five tabs:
+Open **http://127.0.0.1:8088** after the container is running. The top-right
+corner shows the current local date and time (`DD.MM.YYYY` with 24-hour clock).
+Five tabs:
 
 - **Backup** — live list of all containers (any state). Back up selected ones,
   one container, a whole stack, or all running containers with a click. Manual
@@ -80,12 +82,12 @@ Open **http://127.0.0.1:8088** after the container is running. Five tabs:
   the **whole run** end-to-end, or delete a run. **You don't import anything:**
   if you mount a root folder that already contains older backups, they are
   discovered and listed automatically the moment the tool starts.
-- **Schedules** — add/remove schedules. Each tile is collapsible with a summary
-  in its header; containers are grouped by project (toggle a whole project or
-  individual containers). Each schedule has a name, frequency, time, container
-  selection (all-running or explicit), and a "keep last N runs" retention. Each
-  schedule has its **own Save button**; unsaved edits are flagged and you are
-  warned before leaving the tab or page. Saved to
+- **Schedules** — add/remove schedules. Each tile is collapsed by default with a
+  summary in its header; expand one to edit it. Containers are grouped by project
+  (toggle a whole project or individual containers). Each schedule has a name,
+  frequency, time, container selection (all-running or explicit), and a "keep
+  last N runs" retention. Each schedule has its **own Save button**; unsaved edits
+  are flagged and you are warned before leaving the tab or page. Saved to
   `E:\Docker\backups\_config\schedules.json`.
 - **Settings** — the backups root, an optional **destination subfolder** under
   the root for new runs, and the manual-backup retention. Saved to
