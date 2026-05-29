@@ -742,6 +742,7 @@ tr.grp b{font-size:13px}tr.member td{background:transparent}
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 let CT=[], SCHEDS=[], SETTINGS={}, WD=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
 let SCH_COLLAPSED=new Set();
+let SCH_INIT=false;
 let SCH_EXPLICIT=new Set();
 let SCH_BASELINE={};
 function schSnapshot(){SCH_BASELINE={};SCHEDS.forEach(s=>{SCH_BASELINE[s.id]=JSON.stringify(s)})}
@@ -950,6 +951,7 @@ function setStatus(s){
 async function refresh(){
   try{const s=await api("/api/state");
     CT=s.containers;SCHEDS=s.schedules;WD=s.weekdayNames||WD;
+    if(!SCH_INIT){SCHEDS.forEach(x=>SCH_COLLAPSED.add(x.id));SCH_INIT=true;}
     schSnapshot();
     SETTINGS=Object.assign({},s.settings,{root:s.root});
     $("#rootTag").textContent="root: "+s.root;
