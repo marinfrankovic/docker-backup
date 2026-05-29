@@ -1,27 +1,37 @@
 #!/bin/sh
-# One-shot Docker backup.
+# One-shot Docker backup into a specific run directory.
 #
 # Usage:
-#   backup.sh                       # back up ALL running containers
-#   backup.sh <name> [name...]      # back up only the named containers
-#                                   # (stopped ones: volumes + manifest only)
+#   backup.sh <run_subpath>                 # back up ALL running containers
+#   backup.sh <run_subpath> <name> [name..] # back up only the named containers
+#                                           # (stopped ones: volumes + manifest only)
+#
+#   run_subpath : path of THIS backup run, RELATIVE to the backups root, e.g.
+#                 "prod/sched-a1b2/2026-05-29_030000" or "_manual/2026-05-29_141500".
 #
 # For each target container it writes, under
-#   $BACKUP_ROOT_CONTAINER/<YYYY-MM-DD>/<project>/<container>/ :
+#   $BACKUP_ROOT_CONTAINER/<run_subpath>/<project>/<container>/ :
 #     inspect.json              full container manifest
 #     all-databases.sql.gz      logical DB dump (mysql/mariadb/postgres)
 #     volume-<name>.tar.gz      one archive per named volume
-# plus the compose file(s) per project and a _BACKUP_OK.txt marker.
-# Afterwards it prunes day-folders beyond RETENTION_DAYS.
+# plus the compose file(s) per project and a _BACKUP_OK.txt marker for the run.
+#
+# Retention/pruning is handled by the caller (app.py) per schedule, NOT here.
 set -u
 
-RETENTION_DAYS="${RETENTION_DAYS:-7}"
 BACKUP_ROOT_CONTAINER="${BACKUP_ROOT_CONTAINER:-/backups}"
 BACKUP_ROOT_HOST="${BACKUP_ROOT_HOST:?Set BACKUP_ROOT_HOST to the host path of the backups dir}"
 HELPER_IMAGE="${HELPER_IMAGE:-alpine:3.20}"
 SELF_NAME="${SELF_NAME:-docker-backup}"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+[ "$#" -ge 1 ] || { echo "usage: backup.sh <run_subpath> [container...]" >&2; exit 2; }
+RUN_SUBPATH="$1"; shift
+
+DEST="$BACKUP_ROOT_CONTAINER/$RUN_SUBPATH"
+DESTHOST="$BACKUP_ROOT_HOST/$RUN_SUBPATH"
+mkdir -p "$DEST"
 
 is_running() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = "true" ]; }
 
@@ -109,19 +119,6 @@ copy_compose() { # <cid> <pdest>
   done
 }
 
-prune_old() {
-  cd "$BACKUP_ROOT_CONTAINER" || return 0
-  count="$(ls -1d 20*/ 2>/dev/null | wc -l | tr -d ' ')"
-  if [ "${count:-0}" -gt "$RETENTION_DAYS" ]; then
-    remove=$(( count - RETENTION_DAYS ))
-    log "Retention: $count daily backups present, removing oldest $remove (keep $RETENTION_DAYS)"
-    ls -1d 20*/ 2>/dev/null | sort | head -n "$remove" | while read -r old; do
-      log "  prune $old"
-      rm -rf "$old"
-    done
-  fi
-}
-
 backup_one() { # <cid>
   cid="$1"
   name="$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null | sed 's#^/##')"
@@ -141,11 +138,6 @@ backup_one() { # <cid>
   copy_compose "$cid" "$pdest"
 }
 
-day="$(date '+%Y-%m-%d')"
-DEST="$BACKUP_ROOT_CONTAINER/$day"
-DESTHOST="$BACKUP_ROOT_HOST/$day"
-mkdir -p "$DEST"
-
 if [ "$#" -gt 0 ]; then
   log "===== Backup start (selected: $*) -> $DEST ====="
   for arg in "$@"; do
@@ -162,4 +154,3 @@ fi
 
 echo "backup_completed=$(date '+%Y-%m-%d %H:%M:%S')" > "$DEST/_BACKUP_OK.txt"
 log "===== Backup complete: $DEST ====="
-prune_old
