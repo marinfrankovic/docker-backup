@@ -1,56 +1,102 @@
 # Docker backup (always-on container + web GUI)
 
-A self-contained, always-running container that backs up Docker containers on
-this machine to disk. You define **multiple schedules** — each with its own
-frequency (daily / weekly / monthly), set of containers, and retention — and the
-tool keeps the most recent runs per schedule and prunes the rest. New
+A self-contained, always-running container that backs up the other Docker
+containers on this machine to disk. You define **multiple schedules** — each with
+its own frequency (daily / weekly / monthly), set of containers, and retention —
+and the tool keeps the most recent runs per schedule and prunes the rest. New
 stacks/containers are picked up automatically. A built-in **web GUI** lets you
 run manual backups, manage schedules, browse the backups folder, and restore.
 
-The **backups root folder is the single source of truth.** Everything the tool
-produces and everything it can restore lives under that one folder, so after a
-rebuild you only need to point the container at the same root — every prior
-backup is rediscovered and listed on the Restore page automatically.
+> **The backups root folder is the single source of truth.** Everything the tool
+> produces and can restore lives under one folder, so after a rebuild you only
+> point the container at the same root — every prior backup is rediscovered and
+> listed on the Restore page automatically.
 
-- **Location (source):** `E:\Repositories\docker-backup\` (Git repo;
-  see [Source & repository](#source--repository)).
-- **Web GUI:** http://127.0.0.1:8088 (localhost only)
-- **Backups root:** `E:\Docker\backups\` (the host folder mounted at `/backups`)
-- **Run layout:** `<root>\<destination?>\<bucket>\<YYYY-MM-DD_HHMMSS>\<project>\<container>\`
-  where `bucket` is the schedule id, or `_manual` for ad-hoc backups.
-- **Schedules:** any number; each daily/weekly/monthly with its own retention.
-- **Auto-start:** `restart: unless-stopped` — relaunches with Docker Desktop.
+## Contents
+
+- [Key facts](#key-facts)
+- [First run & setup](#first-run--setup)
+- [Web GUI](#web-gui)
+- [What gets backed up](#what-gets-backed-up)
+- [Restore](#restore)
+- [CLI reference](#cli-reference)
+- [Recovery & resilience](#recovery--resilience)
+- [Configuration](#configuration)
+- [Source & repository](#source--repository)
+
+## Key facts
+
+| | |
+|---|---|
+| **Source (repo)** | `E:\Repositories\docker-backup\` (private GitHub repo) |
+| **Web GUI** | http://127.0.0.1:8088 (localhost only) |
+| **Backups root** | `E:\Docker\backups\` (host folder mounted at `/backups`) |
+| **Run layout** | `<root>\<destination?>\<bucket>\<YYYY-MM-DD_HHMMSS>\<project>\<container>\` — `bucket` is the schedule id, or `_manual` for ad-hoc backups |
+| **Schedules** | Any number; each daily/weekly/monthly with its own retention |
+| **Auto-start** | `restart: unless-stopped` — relaunches with Docker Desktop |
+| **Scheduler** | Runs inside the container (no host Task Scheduler) |
+
+## First run & setup
+
+Use this the **first time** you set the tool up on a machine.
+
+1. **Install prerequisites:** Docker Desktop (Linux engine running) and Git.
+2. **Share the `E:` drive with Docker.** In Docker Desktop go to
+   *Settings → Resources → File sharing*, ensure `E:` (or at least `E:\Docker`)
+   is shared, then *Apply & restart*. This is required for the
+   `E:/Docker/backups` bind mount and the helper-container mounts to work.
+3. **Get the source and create the backups folder:**
+   ```powershell
+   git clone <your-private-repo-url> E:\Repositories\docker-backup
+   cd E:\Repositories\docker-backup
+   New-Item -ItemType Directory -Force E:\Docker\backups | Out-Null
+   ```
+4. **Build and start the container:**
+   ```powershell
+   docker compose up -d --build
+   docker ps --filter name=docker-backup
+   ```
+   On first start the tool seeds `E:\Docker\backups\_config\schedules.json` and
+   `settings.json` (one daily schedule at `BACKUP_HOUR`, keeping `RETENTION_DAYS`
+   runs). You edit these later from the GUI.
+5. **Open the GUI** at **http://127.0.0.1:8088**.
+6. **Run a first backup** to confirm everything works: on the **Backup** tab
+   click *Back up all running* (lands in the `_manual` bucket), then check it
+   appears under **Restore → Backup runs found**.
+7. **Create your schedule(s)** on the **Schedules** tab — adjust the seeded
+   schedule or add new ones, then click that schedule's **Save** button.
+8. **(Recommended) Set up an off-machine copy** of `E:\Docker\backups` to survive
+   a full disk loss — see [Recovery & resilience](#recovery--resilience).
 
 ## Web GUI
 
-Open **http://127.0.0.1:8088** after `docker compose up -d`. Five tabs:
+Open **http://127.0.0.1:8088** after the container is running. Five tabs:
 
-- **Backup** — live list of all containers (any state); back up selected ones,
+- **Backup** — live list of all containers (any state). Back up selected ones,
   one container, a whole stack, or all running containers with a click. Manual
   backups land in the `_manual` bucket.
 - **Restore** — two ways to find a backup:
   - *Backup runs found* — the tool scans the root and lists every completed run
-    (newest first). Restore a single project or the **whole run** end-to-end,
-    or delete a run.
+    (newest first). Restore a single project or the **whole run** end-to-end, or
+    delete a run.
   - *Browse backups folder* — a filesystem browser confined to the root. For
-    disaster recovery, navigate manually and restore any folder marked as a
-    run, or restore an **individual project** from inside a run.
-- **Schedules** — add/remove schedules. Each tile is collapsible and shows a
-  summary in its header. Containers are grouped by project (toggle a whole
-  project or individual containers). Each has a name, frequency
-  (daily/weekly/monthly), time, container selection (all-running or explicit),
-  and a "keep last N runs" retention. Each schedule has its **own Save button**;
-  unsaved edits are flagged and you are warned before leaving the tab or page.
-  Saved to `E:\Docker\backups\_config\schedules.json`.
-- **Settings** — shows the backups root, an optional **destination subfolder**
-  under the root for new runs, and the manual-backup retention. Saved to
+    disaster recovery, navigate manually and restore any folder marked as a run,
+    or restore an **individual project** from inside a run.
+- **Schedules** — add/remove schedules. Each tile is collapsible with a summary
+  in its header; containers are grouped by project (toggle a whole project or
+  individual containers). Each schedule has a name, frequency, time, container
+  selection (all-running or explicit), and a "keep last N runs" retention. Each
+  schedule has its **own Save button**; unsaved edits are flagged and you are
+  warned before leaving the tab or page. Saved to
+  `E:\Docker\backups\_config\schedules.json`.
+- **Settings** — the backups root, an optional **destination subfolder** under
+  the root for new runs, and the manual-backup retention. Saved to
   `E:\Docker\backups\_config\settings.json`.
 - **Logs** — live activity log (`E:\Docker\backups\_logs\activity.log`).
 
-The Python scheduler runs inside the same container; there is no host Task
-Scheduler involved.
+## What gets backed up
 
-## What gets backed up (per running container)
+Per running container:
 
 | Item | File |
 |------|------|
@@ -61,58 +107,52 @@ Scheduler involved.
 | Compose file(s) | copied into the project folder |
 | Completion marker | `_BACKUP_OK.txt` (at the run folder; marks a discoverable run) |
 
-Databases are dumped logically **and** their volumes archived, so you have two
+Databases are dumped logically **and** their volumes archived, giving you two
 recovery paths.
 
-## Deploy
+## Restore
 
-```powershell
-cd E:\Repositories\docker-backup
-docker compose build
-docker compose up -d
-docker ps --filter name=docker-backup
-```
+> **Restore is fully automated and overwrites current data.** Pick a run in the
+> GUI (or use the [CLI](#cli-reference)) and the tool runs all four phases in the
+> background, for the chosen project — or for every project in the run:
 
-> **Docker Desktop:** the `E:` drive must be shared (Settings → Resources →
-> File sharing) so the `E:/Docker/backups` bind mount and the sibling helper
-> mounts work. `E:\Docker` is already the configured Docker home on this machine.
+1. **Stop** every container belonging to the project (so volume writes are
+   consistent).
+2. **Overwrite** each named volume — existing contents are wiped and replaced
+   with the backed-up snapshot.
+3. **Start** the containers again (database containers first).
+4. **Re-import** the SQL dump **only** where no volume archive covered the data.
+   When a volume archive exists the database is already restored from it, so the
+   redundant SQL import is skipped to avoid conflicts. The tool waits for the DB
+   to accept connections before importing.
 
-## Operate
+Progress shows in the status badge and the **Logs** tab. Only one backup or
+restore runs at a time.
 
-Most operations are easiest from the **web GUI** (http://127.0.0.1:8088).
-Equivalent CLI commands:
+Known project names on this machine: `brajkovic-local`, `villamakar-local`,
+`local-wordpress-multirent`, and the standalone `bank-statement-analyzer` (its
+external volume `bank-statement-analyzer-data` is recreated on restore).
+
+For recovery after a machine rebuild, see
+[Full disaster recovery](#full-disaster-recovery-machine-rebuilt).
+
+## CLI reference
+
+Most operations are easiest from the GUI, but equivalent CLI commands exist:
 
 ```powershell
 # Watch the daemon / GUI / scheduler
 docker logs -f docker-backup
 
-# Force a backup right now from the CLI (GUI "Back up" buttons do the same).
-# The first argument is the run sub-path (relative to the root).
+# Force a backup now (GUI "Back up" buttons do the same).
+# First argument is the run sub-path (relative to the root).
 docker exec docker-backup backup.sh _manual/manual-now                       # all running
 docker exec docker-backup backup.sh _manual/manual-now brajkovic-local-db-1  # specific container(s)
 
 # List backup runs found on disk
 docker exec docker-backup restore.sh --list
-```
 
-## Restore
-
-Restore is **fully automated and overwrites current data**. Pick a run in the
-GUI (or run the CLI below) and the tool runs all four phases in order, in the
-background, for the chosen project — or for every project in the run:
-
-1. **Stop** every container belonging to the project (so volume writes are
-   consistent).
-2. **Overwrite** each named volume — the existing volume contents are wiped and
-   replaced with the backed-up snapshot.
-3. **Start** the containers again (database containers first).
-4. **Re-import** the SQL dump **only** where no volume archive covered the data;
-   when a volume archive exists the database is already restored from it, so the
-   redundant SQL import is skipped to avoid conflicts. The tool waits for the DB
-   to accept connections before importing.
-
-```powershell
-# Restore from a run sub-path (relative to the root). Add a project to limit it.
+# Restore from a run sub-path. Add a project name to limit it to that project.
 docker exec docker-backup restore.sh _manual/2026-05-29_141500
 docker exec docker-backup restore.sh nightly/2026-05-29_030000 brajkovic-local
 
@@ -120,37 +160,10 @@ docker exec docker-backup restore.sh nightly/2026-05-29_030000 brajkovic-local
 docker exec docker-backup restore.sh 2026-05-26 villamakar-local
 ```
 
-Progress shows in the status badge and the **Logs** tab. Only one backup or
-restore runs at a time.
+## Recovery & resilience
 
-Known project names on this machine:
-`brajkovic-local`, `villamakar-local`, `local-wordpress-multirent`, and the
-standalone `bank-statement-analyzer` (its external volume
-`bank-statement-analyzer-data` is recreated on restore).
-
-### Full disaster recovery (machine rebuilt)
-
-The automated restore overwrites **existing** containers. If the containers no
-longer exist (e.g. the machine was rebuilt), recreate the stack first so the
-tool has containers to stop/start and DBs to import into:
-
-1. Reinstall Docker Desktop and re-create `E:\Docker\backups` (or restore it
-   from off-machine copy — see below).
-2. `git clone` the project repo(s) and `docker compose up -d` to create the
-   containers, empty volumes and databases.
-3. `docker exec docker-backup restore.sh <run> <project>` — this stops the
-   fresh containers, overwrites their volumes with the backup, starts them
-   again, and re-imports the DB where needed. Use the **Restore** tab to find
-   the exact run sub-path, or `restore.sh --list`.
-
-> **Off-machine copy:** this tool protects against container/volume loss. To
-> survive total disk failure, also copy `E:\Docker\backups` to another
-> disk/cloud (e.g. a scheduled robocopy or your existing restic job).
-
-## Resilience — what if I lose the backup container?
-
-**The backup container is disposable. It stores nothing of its own** — every
-bit of state lives on disk via host bind mounts, not inside the container:
+**The backup container is disposable — it stores nothing of its own.** Every bit
+of state lives on disk via host bind mounts, not inside the container:
 
 | Item | Where it lives | Survives container loss? |
 |------|----------------|--------------------------|
@@ -160,38 +173,88 @@ bit of state lives on disk via host bind mounts, not inside the container:
 | Activity log | `E:\Docker\backups\_logs\activity.log` | ✅ yes |
 | The tool's source | `E:\Repositories\docker-backup\` (+ GitHub) | ✅ yes |
 
-**Scenario 1 — container deleted/crashed, image still present.** It auto-recovers
-via `restart: unless-stopped` when Docker Desktop starts. If you removed it
-manually, just bring it back:
-
-```powershell
-cd E:\Repositories\docker-backup
-docker compose up -d
-```
-
-It re-attaches to the same `E:\Docker\backups` folder, reads the existing
-schedules, and continues. **No backups are lost.**
-
-**Scenario 2 — image also gone, or machine rebuilt.** Rebuild from source (it is
-all in this repo):
-
-```powershell
-git clone <your-private-repo-url> E:\Repositories\docker-backup
-cd E:\Repositories\docker-backup
-docker compose up -d --build
-```
-
-As long as `E:\Docker\backups` still exists (or is restored from an off-machine
-copy), the rebuilt container immediately sees all previous backups.
-
 > **The only real risk** is losing the **`E:` disk itself** — both your stacks
 > *and* their backups live there. Guard against that with an off-machine copy of
 > `E:\Docker\backups` (robocopy to another disk, or a restic/cloud job).
 
+### Update / redeploy the tool
+
+After editing the source, rebuild from the repo folder:
+
+```powershell
+cd E:\Repositories\docker-backup
+docker compose up -d --build
+docker ps --filter name=docker-backup
+```
+
+If the container was just deleted/stopped (image still present), it auto-recovers
+via `restart: unless-stopped` when Docker Desktop starts; to bring it back
+manually run `docker compose up -d`. Either way it re-attaches to the same
+`E:\Docker\backups` folder, reads the existing schedules, and continues — **no
+backups are lost.**
+
+### Rebuild with an existing backups folder
+
+Use this when you are **reinstalling / rebuilding the tool** but already have a
+populated `E:\Docker\backups` folder (from this machine or restored from an
+off-machine copy). Because the backups root is the single source of truth,
+nothing needs to be imported — the tool rediscovers everything.
+
+1. **Put the backups folder in place** at `E:\Docker\backups` (with its
+   `_config\`, `_logs\`, and existing run folders). If restoring from an
+   off-machine copy, put it back at that exact path first.
+2. **Confirm `E:` is shared** with Docker Desktop
+   (see [First run](#first-run--setup) step 2).
+3. **Get the source and (re)build:**
+   ```powershell
+   git clone <your-private-repo-url> E:\Repositories\docker-backup   # if not already present
+   cd E:\Repositories\docker-backup
+   docker compose up -d --build
+   ```
+4. **Open the GUI** at **http://127.0.0.1:8088**. The tool re-reads the existing
+   `_config\` files, and **Restore → Backup runs found** immediately lists every
+   prior run on disk. No backups are lost and no schedules need recreating.
+
+> This restores only the **backup tool**. To recover the actual application
+> containers/volumes from a backup, see [Restore](#restore) and
+> [Full disaster recovery](#full-disaster-recovery-machine-rebuilt).
+
+### Full disaster recovery (machine rebuilt)
+
+The automated restore overwrites **existing** containers. If the containers no
+longer exist (e.g. the machine was rebuilt), recreate the stacks first so the
+tool has containers to stop/start and DBs to import into:
+
+1. Reinstall Docker Desktop and put `E:\Docker\backups` back in place (restore it
+   from your off-machine copy if needed).
+2. `git clone` the application repo(s) and `docker compose up -d` to create the
+   containers, empty volumes, and databases.
+3. `docker exec docker-backup restore.sh <run> <project>` — this stops the fresh
+   containers, overwrites their volumes with the backup, starts them again, and
+   re-imports the DB where needed. Use the **Restore** tab to find the exact run
+   sub-path, or `restore.sh --list`.
+
+## Configuration
+
+Schedules, the destination subfolder, and manual retention are managed in the
+**GUI** (persisted in `E:\Docker\backups\_config\schedules.json` and
+`settings.json`). The `compose.yaml` env vars below set initial defaults and
+runtime behavior; edit them, then `docker compose up -d --build`:
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `BACKUP_HOUR` | `3` | Time for the seed schedule (first run only) |
+| `RETENTION_DAYS` | `7` | Default "keep last N runs" for new schedules |
+| `BACKUP_ROOT_CONTAINER` | `/backups` | Backups root inside the container |
+| `BACKUP_ROOT_HOST` | `E:/Docker/backups` | Same host path as the `/backups` mount (for helper-container volume mounts) |
+| `TZ` | `Europe/Zagreb` | Timezone for the scheduler |
+| `GUI_PORT` | `8088` | Web GUI port (also map it in `ports:`) |
+| `HELPER_IMAGE` | `alpine:3.20` | Image used to tar/untar volumes |
+
 ## Source & repository
 
-The tool lives in its own Git repository at `E:\Repositories\docker-backup\`
-(private GitHub repo). Only the source files are tracked:
+The tool lives in its own private Git repo at `E:\Repositories\docker-backup\`.
+Only the source files are tracked:
 
 ```
 app.py          web GUI + scheduler (Python stdlib)
@@ -204,26 +267,8 @@ README.md       this document
 ```
 
 Backups, logs, and config are **not** in the repo — they live under
-`E:\Docker\backups` and are intentionally excluded. To update the tool: edit the
-source, commit/push, then `docker compose up -d --build` from the repo folder.
+`E:\Docker\backups` and are intentionally excluded.
 
 > Shell scripts (`*.sh`) and `app.py` must keep **LF** line endings and UTF-8
 > (no BOM) so they run under the container's BusyBox `sh`. A `.gitattributes`
 > entry enforces this on checkout.
-
-## Configuration
-
-Schedules, the destination subfolder, and manual retention are managed in the
-**GUI** (persisted in `E:\Docker\backups\_config\schedules.json` and
-`settings.json`). The `compose.yaml` env vars below set initial defaults and
-runtime behavior; edit them then `docker compose up -d --build`:
-
-| Var | Default | Meaning |
-|-----|---------|---------|
-| `BACKUP_HOUR` | `3` | Default time for the seed schedule (first run only) |
-| `RETENTION_DAYS` | `7` | Default "keep last N runs" for new schedules |
-| `BACKUP_ROOT_CONTAINER` | `/backups` | Backups root inside the container |
-| `BACKUP_ROOT_HOST` | `E:/Docker/backups` | Same host path as the `/backups` mount (for helper-container volume mounts) |
-| `TZ` | `Europe/Zagreb` | Timezone for the scheduler |
-| `GUI_PORT` | `8088` | Web GUI port (also map it in `ports:`) |
-| `HELPER_IMAGE` | `alpine:3.20` | Image used to tar/untar volumes |

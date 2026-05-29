@@ -820,13 +820,13 @@ function renderContainers(){
     const gid="g_"+proj.replace(/[^A-Za-z0-9]/g,"_");
     const gh=document.createElement("tr");gh.className="grp";
     gh.innerHTML=`<td><input type=checkbox title="Select stack" onclick="toggleGroup('${gid}',this)"></td>
-      <td colspan=4><span class=caret onclick="toggleCollapse('${gid}',this)">\u25be</span>
+      <td colspan=4><span class=caret onclick="toggleCollapse('${gid}',this)">\u25b8</span>
         <b>\uD83D\uDCE6 ${esc(label)}</b>
         <span class=tag>&nbsp;${list.length} container${list.length>1?"s":""} \u00b7 ${running} running</span></td>
       <td class=right><button class="btn sm" onclick="backupProject('${esc(proj)}')">Back up stack</button></td>`;
     tb.appendChild(gh);
     list.forEach(c=>{
-      const tr=document.createElement("tr");tr.className="member "+gid;
+      const tr=document.createElement("tr");tr.className="member hidden "+gid;
       tr.innerHTML=`<td style="padding-left:30px"><input type=checkbox class="csel ${gid}" value="${esc(c.name)}"></td>
         <td><b>${esc(c.name)}</b></td><td class=muted>${esc(c.project)}</td>
         <td class=tag>${esc(c.image)}</td>
