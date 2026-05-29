@@ -5,7 +5,7 @@ containers on this machine to disk. You define **multiple schedules** — each w
 its own frequency (daily / weekly / monthly), set of containers, and retention —
 and the tool keeps the most recent runs per schedule and prunes the rest. New
 stacks/containers are picked up automatically. A built-in **web GUI** lets you
-run manual backups, manage schedules, browse the backups folder, and restore.
+run manual backups, manage schedules, and restore — all from the browser.
 
 > **The backups root folder is the single source of truth.** Everything the tool
 > produces and can restore lives under one folder, so after a rebuild you only
@@ -75,13 +75,11 @@ Open **http://127.0.0.1:8088** after the container is running. Five tabs:
 - **Backup** — live list of all containers (any state). Back up selected ones,
   one container, a whole stack, or all running containers with a click. Manual
   backups land in the `_manual` bucket.
-- **Restore** — two ways to find a backup:
-  - *Backup runs found* — the tool scans the root and lists every completed run
-    (newest first). Restore a single project or the **whole run** end-to-end, or
-    delete a run.
-  - *Browse backups folder* — a filesystem browser confined to the root. For
-    disaster recovery, navigate manually and restore any folder marked as a run,
-    or restore an **individual project** from inside a run.
+- **Restore** — lists every completed backup run found under the root (newest
+  first), each collapsed by default; expand one to restore a single project or
+  the **whole run** end-to-end, or delete a run. **You don't import anything:**
+  if you mount a root folder that already contains older backups, they are
+  discovered and listed automatically the moment the tool starts.
 - **Schedules** — add/remove schedules. Each tile is collapsible with a summary
   in its header; containers are grouped by project (toggle a whole project or
   individual containers). Each schedule has a name, frequency, time, container

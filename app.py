@@ -341,35 +341,6 @@ def list_runs():
     return runs
 
 
-def browse(rel):
-    """List immediate children of <root>/<rel> for the filesystem browser."""
-    target = _abs(rel)
-    if target is None or not os.path.isdir(target):
-        return None
-    rel_clean = os.path.relpath(target, BACKUP_ROOT).replace("\\", "/")
-    if rel_clean == ".":
-        rel_clean = ""
-    in_run = os.path.isfile(os.path.join(target, "_BACKUP_OK.txt"))
-    entries = []
-    try:
-        names = sorted(os.listdir(target))
-    except OSError:
-        return None
-    for name in names:
-        full = os.path.join(target, name)
-        is_dir = os.path.isdir(full)
-        is_run = is_dir and os.path.isfile(os.path.join(full, "_BACKUP_OK.txt"))
-        # a project = a real subfolder directly inside a run (not bookkeeping)
-        is_project = in_run and is_dir and not name.startswith("_")
-        child_rel = (rel_clean + "/" + name).strip("/")
-        entries.append({"name": name, "dir": is_dir, "isRun": is_run,
-                        "isProject": is_project, "rel": child_rel})
-    entries.sort(key=lambda e: (not e["dir"], e["name"].lower()))
-    parent = "" if not rel_clean else rel_clean.rsplit("/", 1)[0] if "/" in rel_clean else ""
-    return {"path": rel_clean, "parent": parent, "atRoot": rel_clean == "",
-            "inRun": in_run, "entries": entries}
-
-
 # --------------------------------------------------------------------------- #
 # backup / restore / delete actions
 # --------------------------------------------------------------------------- #
@@ -569,12 +540,6 @@ class Handler(BaseHTTPRequestHandler):
             self._json(list_containers())
         elif path == "/api/runs":
             self._json(list_runs())
-        elif path == "/api/browse":
-            rel = (self._query().get("path", [""])[0])
-            res = browse(rel)
-            if res is None:
-                return self._json({"error": "invalid path"}, 400)
-            self._json(res)
         elif path == "/api/schedules":
             self._json({"schedules": load_schedules()})
         elif path == "/api/settings":
@@ -683,11 +648,6 @@ tr.grp b{font-size:13px}tr.member td{background:transparent}
 .sched-head .sched-caret{color:var(--muted);user-select:none;width:14px;text-align:center}
 .chip.sm{font-size:10px;padding:1px 6px}
 .sched .fld span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
-.crumbs{display:flex;gap:4px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
-.crumbs a{color:var(--accent);cursor:pointer}
-.brow{display:flex;align-items:center;gap:8px;padding:7px 10px;border-bottom:1px solid var(--line)}
-.brow:last-child{border-bottom:none}.brow .nm{cursor:pointer}.brow .nm:hover{text-decoration:underline}
-.pill{font-size:10px;padding:2px 7px;border-radius:10px;background:#16324f;color:#9cc4ff}
 </style></head>
 <body>
 <header>
@@ -729,12 +689,6 @@ tr.grp b{font-size:13px}tr.member td{background:transparent}
         <span class="right tag" id="rootTag"></span></div>
       <p class="tag" style="margin:6px 0 0">Discovered by scanning the backups root. After a rebuild, point the tool at the same root and every prior run appears here automatically.</p>
       <div id="runs" style="margin-top:10px"></div>
-    </div>
-    <div class="card">
-      <h2>Browse backups folder</h2>
-      <p class="tag" style="margin:0 0 8px">For disaster recovery: navigate the root manually and restore from any run folder (marked <span class="pill">run</span>).</p>
-      <div class="crumbs" id="crumbs"></div>
-      <div id="browser"></div>
     </div>
   </section>
   <!-- SCHEDULES -->
@@ -805,7 +759,6 @@ $$("nav button").forEach(b=>b.onclick=()=>{
   $$("nav button").forEach(x=>x.classList.remove("active"));b.classList.add("active");
   ["backup","restore","schedules","settings","logs"].forEach(t=>$("#tab-"+t).classList.toggle("hidden",t!==b.dataset.tab));
   if(b.dataset.tab==="logs")loadLogs();
-  if(b.dataset.tab==="restore")openBrowse("");
 });
 
 /* ---------------- Backup ---------------- */
@@ -856,7 +809,7 @@ function renderRuns(runs){
   const el=$("#runs");el.innerHTML="";
   if(!runs.length){el.innerHTML='<p class=muted>No backup runs found under the root yet.</p>';return}
   runs.forEach((r,i)=>{
-    const det=document.createElement("details");det.open=i===0;
+    const det=document.createElement("details");
     const when=r.mtime?new Date(r.mtime*1000).toLocaleString():"";
     const rows=r.projects.map(p=>`<tr>
       <td><b>${esc(p.name)}</b><div class=tag>${esc(p.containers.join(", "))}</div></td>
@@ -870,31 +823,6 @@ function renderRuns(runs){
       <table style="margin-top:8px">${rows||'<tr><td class=muted>empty</td></tr>'}</table>`;
     el.appendChild(det);
   });
-}
-async function openBrowse(path){
-  try{const r=await api("/api/browse?path="+encodeURIComponent(path));
-    const cr=$("#crumbs");cr.innerHTML="";
-    const root=document.createElement("a");root.textContent="root";root.onclick=()=>openBrowse("");cr.appendChild(root);
-    if(r.path){let acc="";r.path.split("/").forEach(seg=>{acc=acc?acc+"/"+seg:seg;const cp=acc;
-      cr.insertAdjacentHTML("beforeend"," / ");const a=document.createElement("a");a.textContent=seg;a.onclick=()=>openBrowse(cp);cr.appendChild(a)})}
-    const b=$("#browser");b.innerHTML="";
-    if(!r.entries.length){b.innerHTML='<p class=muted>(empty)</p>';return}
-    r.entries.forEach(e=>{
-      const row=document.createElement("div");row.className="brow";
-      const icon=e.dir?(e.isRun?"\uD83D\uDCBE":"\uD83D\uDCC1"):"\uD83D\uDCC4";
-      let html=`<span>${icon}</span><span class="nm">${esc(e.name)}</span>`;
-      if(e.isRun)html+=` <span class="pill">run</span>`;
-      if(e.isProject)html+=` <span class="pill">project</span>`;
-      row.innerHTML=html;
-      const nm=row.querySelector(".nm");
-      if(e.dir)nm.onclick=()=>openBrowse(e.rel);
-      if(e.isRun){const btn=document.createElement("button");btn.className="btn sm right";btn.textContent="Restore this run";
-        btn.onclick=()=>restore(e.rel,null);row.appendChild(btn)}
-      else if(e.isProject){const btn=document.createElement("button");btn.className="btn sm right";btn.textContent="Restore project";
-        btn.onclick=()=>restore(r.path,e.name);row.appendChild(btn)}
-      b.appendChild(row);
-    });
-  }catch(e){toast("Error: "+e.message)}
 }
 async function restore(run,project){
   const what=project?`project "${project}"`:"the whole run";
