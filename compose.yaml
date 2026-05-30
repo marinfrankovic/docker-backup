@@ -8,20 +8,22 @@ services:
     hostname: docker-backup
     restart: unless-stopped          # always-on; auto-starts with Docker Desktop
     environment:
-      TZ: Europe/Zagreb              # local time used by the scheduler
-      BACKUP_HOUR: "3"               # default time for the first/seed schedule
-      RETENTION_DAYS: "7"            # default "keep last N runs" for new schedules
-      BACKUP_ROOT_CONTAINER: /backups          # backups root inside the container
-      BACKUP_ROOT_HOST: "E:/Docker/backups"   # SAME host path as the mount below
+      # Values come from your local .env file (copy .env.example -> .env).
+      TZ: ${TZ:-UTC}                            # local time used by the scheduler
+      BACKUP_HOUR: ${BACKUP_HOUR:-3}           # default time for the first/seed schedule
+      RETENTION_DAYS: ${RETENTION_DAYS:-7}     # default "keep last N runs" for new schedules
+      BACKUP_ROOT_CONTAINER: /backups          # backups root inside the container (leave as-is)
+      BACKUP_ROOT_HOST: ${BACKUP_ROOT_HOST}    # SAME host path as the mount below
                                                # (used for sibling helper-container mounts)
-      HELPER_IMAGE: alpine:3.20
+      HELPER_IMAGE: ${HELPER_IMAGE:-alpine:3.20}
       SELF_NAME: docker-backup
-      GUI_PORT: "8088"
+      GUI_PORT: ${GUI_PORT:-8088}
     ports:
-      - "127.0.0.1:8088:8088"         # web GUI, bound to localhost only
+      - "127.0.0.1:${GUI_PORT:-8088}:${GUI_PORT:-8088}"   # web GUI, bound to localhost only
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock   # discover/exec all containers
       # Backups ROOT: the single source of truth. Point this at the host folder
       # that holds (or will hold) all backups. On a rebuild, keep this the same
       # and every prior run is rediscovered and listed on the Restore page.
-      - "E:/Docker/backups:/backups"
+      - "${BACKUP_ROOT_HOST}:/backups"
+
