@@ -4,11 +4,19 @@
 # Fully automated overwrite restore of every project (or one project) inside a
 # backup run:
 #   1. stop every container that belongs to the project
-#   2. overwrite each named volume with the backed-up snapshot
+#   2. overwrite each named volume AND bind-mounted host path with the snapshot
+#   2b. recreate any MISSING containers from the saved compose file (this makes a
+#       "from zero" restore on a fresh Docker engine work end to end)
 #   3. start the containers again (database containers first)
-#   4. re-import the SQL dump ONLY where no volume archive covered the data
-#      (when a volume archive exists the data directory is already restored,
+#   4. re-import the SQL dump ONLY where no volume/bind archive covered the data
+#      (when a data archive exists the data directory is already restored,
 #       so a second SQL import is skipped to avoid conflicts)
+#
+# Two supported scenarios:
+#   * Containers still exist  -> they are stopped, overwritten, and restarted.
+#   * Fresh/empty Docker host -> containers are recreated from the saved compose
+#     file with restored volumes + bind config. (Large media excluded at backup
+#     time must be restored separately by the operator.)
 #
 # Usage:
 #   restore.sh <run_subpath> [project] [container]   # whole run, one project, or one container
@@ -95,7 +103,7 @@ restore_project() { # <project_name>
   done
 
   # --- Phase 2: overwrite the named volumes with the backed-up data ------------
-  log "  Phase 2/4: restoring volumes (overwrite)"
+  log "  Phase 2/4: restoring volumes & bind mounts (overwrite)"
   for cdir in "$base"/*/; do
     [ -d "$cdir" ] || continue
     cname="$(basename "$cdir")"
@@ -114,7 +122,81 @@ restore_project() { # <project_name>
         log "      WARN restore failed for volume $vol"
       fi
     done
+
+    # bind-mounted host paths captured in binds.tsv
+    [ -f "$cdir/binds.tsv" ] || continue
+    while IFS="$(printf '\t')" read -r arc src dst; do
+      [ -z "$arc" ] && continue
+      [ -f "$cdir/$arc" ] || { log "    WARN missing bind archive $arc"; continue; }
+      sbase="$(basename "$src")"
+      sdir="$(dirname "$src")"
+      log "    bind <- $src (was $dst)"
+      # Mount the PARENT dir; replace only the backed-up basename so unrelated
+      # siblings in the same directory are left untouched.
+      if ! docker run --rm \
+            -v "$sdir":/to \
+            -v "$chost":/from:ro \
+            "$HELPER_IMAGE" \
+            sh -c "rm -rf '/to/$sbase' 2>/dev/null; tar xzf '/from/$arc' -C /to" 2>/dev/null; then
+        log "      WARN restore failed for bind $src"
+      fi
+    done < "$cdir/binds.tsv"
   done
+
+  # --- Phase 2.5: recreate MISSING containers from the saved compose file ------
+  # This is what makes a "from zero" restore work: on a fresh Docker engine the
+  # containers don't exist yet, so there is nothing to start. We rebuild the
+  # project's working dir (compose file + .env) and run `docker compose up -d`.
+  # Volumes and bind mounts were already restored above, so the containers come
+  # up with their real data. (Scenario 1 — containers already exist — skips this
+  # entirely and uses the stop/overwrite/start path.)
+  if [ -z "$CONTAINER_FILTER" ] && [ -f "$base/compose.meta" ]; then
+    missing=0
+    for cdir in "$base"/*/; do
+      [ -d "$cdir" ] || continue
+      exists "$(basename "$cdir")" || { missing=1; break; }
+    done
+    if [ "$missing" = "1" ]; then
+      wdir="$(awk -F '\t' '$1=="working_dir"{print $2; exit}' "$base/compose.meta")"
+      cfiles="$(awk -F '\t' '$1=="compose_file"{print $2}' "$base/compose.meta")"
+      if [ -n "$wdir" ] && [ -n "$cfiles" ]; then
+        log "  Phase 2.5/4: recreating missing containers via 'docker compose up' (project '$project')"
+        # Reconstruct the project dir INSIDE this container at its ORIGINAL
+        # absolute path, so compose resolves relative bind paths (./conf) to the
+        # SAME host paths we just restored, and finds the project's .env.
+        mkdir -p "$wdir"
+        composeargs=""
+        for cf in $cfiles; do
+          [ -f "$base/$cf" ] || continue
+          cp -f "$base/$cf" "$wdir/$cf"
+          composeargs="$composeargs -f $wdir/$cf"
+        done
+        [ -f "$base/.env" ] && cp -f "$base/.env" "$wdir/.env"
+
+        # Also write the compose file(s) + .env back to the HOST project dir, so
+        # the stack can be managed normally (docker compose up/down) after a bare
+        # metal recovery. Best effort.
+        whost="$(dirname "$wdir")"; wbase="$(basename "$wdir")"
+        docker run --rm -v "$whost":/host "$HELPER_IMAGE" sh -c "mkdir -p '/host/$wbase'" 2>/dev/null || true
+        for cf in $cfiles; do
+          docker run --rm -v "$basehost":/src:ro -v "$whost":/host "$HELPER_IMAGE" \
+            sh -c "[ -f '/src/$cf' ] && cp -f '/src/$cf' '/host/$wbase/$cf'" 2>/dev/null || true
+        done
+        docker run --rm -v "$basehost":/src:ro -v "$whost":/host "$HELPER_IMAGE" \
+          sh -c "[ -f /src/.env ] && cp -f /src/.env '/host/$wbase/.env'" 2>/dev/null || true
+
+        if [ -n "$composeargs" ]; then
+          if docker compose --project-directory "$wdir" -p "$project" $composeargs up -d 2>&1 | sed 's/^/      /'; then
+            log "    compose up complete"
+          else
+            log "    WARN compose up reported errors (see above)"
+          fi
+        fi
+      else
+        log "  Phase 2.5/4: containers missing but compose.meta is incomplete; cannot auto-recreate '$project'"
+      fi
+    fi
+  fi
 
   # --- Phase 3: start the containers again (databases first) -------------------
   log "  Phase 3/4: starting project containers"
@@ -147,8 +229,9 @@ restore_project() { # <project_name>
 
     has_vol=0
     for v in "$cdir"volume-*.tar.gz; do [ -f "$v" ] && has_vol=1; done
+    [ -f "$cdir/binds.tsv" ] && has_vol=1
     if [ "$has_vol" = "1" ]; then
-      log "    $cname: data restored from volume archive; skipping SQL re-import"
+      log "    $cname: data restored from volume/bind archive; skipping SQL re-import"
       continue
     fi
 

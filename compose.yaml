@@ -18,6 +18,10 @@ services:
       HELPER_IMAGE: ${HELPER_IMAGE:-alpine:3.20}
       SELF_NAME: docker-backup
       GUI_PORT: ${GUI_PORT:-8088}
+      # Optional exclusion globs; unset = built-in defaults (skip media libraries
+      # for volumes, plus Docker socket/host system files for bind mounts).
+      EXCLUDE_VOLUME_PATTERNS: ${EXCLUDE_VOLUME_PATTERNS:-}
+      EXCLUDE_BIND_PATTERNS: ${EXCLUDE_BIND_PATTERNS:-}
     ports:
       - "127.0.0.1:${GUI_PORT:-8088}:${GUI_PORT:-8088}"   # web GUI, bound to localhost only
     volumes:

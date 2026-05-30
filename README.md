@@ -234,9 +234,15 @@ incomplete (no `_BACKUP_OK.txt`) and can be deleted from **Restore**.
 ## What gets backed up
 
 For each container: a details file (`inspect.json`), all its data volumes
-(`volume-*.tar.gz`), its databases (saved with `mysqldump` / `pg_dumpall`,
+(`volume-*.tar.gz`), its **bind-mounted folders/files** (`bind-*.tar.gz`, listed
+in `binds.tsv`), its databases (saved with `mysqldump` / `pg_dumpall`,
 compressed), and its compose file. A `_BACKUP_OK.txt` file marks a finished
 backup.
+
+This means **every container is fully restorable with all its config** — whether
+it stores data in a named Docker volume *or* a bind-mounted host folder (for
+example AdGuard Home's `conf` folder, or any `./config:/...` mount in your compose
+file). This applies to **every Docker project and container**, not any specific app.
 
 **Large media libraries are skipped by default.** Volumes whose names look like
 media content (movies, TV/shows/series, music, anime, downloads/torrents, or any
@@ -251,6 +257,26 @@ skip patterns are:
 To change them, set the `EXCLUDE_VOLUME_PATTERNS` environment variable on the
 `docker-backup` service (space-separated shell globs). Set it to an empty string
 to back up every volume.
+
+**Bind mounts are filtered the same way.** A bind is skipped when its host path
+*or* its in-container path matches a pattern in `EXCLUDE_BIND_PATTERNS`. The
+defaults skip the Docker socket, host system files (`/proc`, `/sys`, `/dev`,
+`/etc/localtime`, `/etc/hosts`, …) and the same media globs as above:
+
+```
+*/docker.sock /run/docker.sock /var/run/docker.sock /proc /proc/* /sys /sys/* /dev /dev/* \
+/etc/localtime /etc/timezone /etc/hostname /etc/hosts /etc/resolv.conf \
+*movies* *movie* *tv* *shows* *series* *media* *music* *anime* *downloads* *torrents*
+```
+
+To exclude an additional large, regenerable folder (for example AdGuard's 6 GB
+query-log `work` directory), append your own glob, e.g.:
+
+```
+EXCLUDE_BIND_PATTERNS="…defaults… */adguardhome/work"
+```
+
+Set it to an empty string to back up every bind mount.
 
 Databases are saved two ways — as a database dump **and** inside the volume copy
 — so you have two ways to recover. Stopped containers skip the live database dump,
@@ -272,9 +298,11 @@ Restoring **overwrites current data**. You can restore at three levels:
   the **Restore** tab and use the **Restore container** button next to its name).
 
 For whatever you pick, the tool: stops the affected container(s) → replaces each
-data volume with the backup → starts them again (databases first) → re-imports the
-database dump only where the volume copy didn't already cover it. Only one backup
-or restore runs at a time.
+data volume **and bind-mounted folder** with the backup → starts them again
+(databases first) → re-imports the database dump only where the volume/bind copy
+didn't already cover it. When restoring a bind mount, only the backed-up
+folder/file is replaced, so unrelated siblings on the host are left untouched.
+Only one backup or restore runs at a time.
 
 You can also do it from the terminal (the web page does the same):
 ```bash
@@ -291,10 +319,30 @@ The tool itself stores nothing — your backups, schedules, settings, and logs a
 live in your backup folder. The only real risk is losing the **disk** that holds
 it, so keep a copy somewhere else (another drive, or a cloud/backup service).
 
-To recover after a reinstall: put the backup folder back at the same
-`BACKUP_ROOT_HOST` path, run `docker compose up -d --build`, and every old backup
-is listed again. If the original apps no longer exist, recreate them first
-(`docker compose up -d` in their own folders), then restore from the web page.
+There are two restore situations, and both are handled automatically:
+
+1. **The container/project still exists** (you just want to roll back). Restore
+   stops it, overwrites its volumes and bind-mounted config with the snapshot,
+   and starts it again.
+2. **From zero — a brand-new Docker engine** (disk died, fresh machine). The
+   containers don't exist yet, so restore **recreates them** from the compose
+   file saved in the backup (`docker compose up -d`), with the volumes and
+   bind-mounted config restored first, so each app comes back with its real data.
+
+For case 2 the backup already includes, per project, the compose file(s), the
+project's `.env`, and a small `compose.meta` (the original working directory and
+compose file names) so the stack can be rebuilt exactly where it was. **Large
+media libraries are excluded from backups on purpose — you are responsible for
+restoring that media separately** (it's typically already stored elsewhere).
+
+To recover after a total failure:
+
+1. Install Docker, put the backup folder back at the same `BACKUP_ROOT_HOST`
+   path, and run `docker compose up -d --build` to start docker-backup itself.
+2. Open the **Restore** tab, pick the latest run, and restore. Missing
+   containers are recreated from their saved compose files; existing ones are
+   overwritten in place.
+3. Restore any excluded media libraries separately, by hand.
 
 ## Settings reference (`.env`)
 
