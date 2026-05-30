@@ -25,7 +25,7 @@ docker run -d --name docker-backup --restart unless-stopped \
   -e BACKUP_ROOT_HOST=/srv/docker-backups \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /srv/docker-backups:/backups \
-  marinfrankovic/docker-backup:latest
+  mfrankovic/docker-backup:latest
 ```
 
 Then open <http://127.0.0.1:8088>.
@@ -39,7 +39,7 @@ Prefer Compose? Use this `compose.yaml` (pulls the image instead of building):
 ```yaml
 services:
   docker-backup:
-    image: marinfrankovic/docker-backup:latest
+    image: mfrankovic/docker-backup:latest
     container_name: docker-backup
     restart: unless-stopped
     environment:

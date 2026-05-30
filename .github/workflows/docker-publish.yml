@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
 
 env:
-  IMAGE: marinfrankovic/docker-backup
+  IMAGE: mfrankovic/docker-backup
 
 jobs:
   build-push:
