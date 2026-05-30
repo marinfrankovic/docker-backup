@@ -59,7 +59,8 @@ WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]  # Python week
 _run_lock = threading.Lock()      # only one backup/restore at a time
 _log_lock = threading.Lock()
 _cfg_lock = threading.Lock()      # serialise config reads/writes
-STATE = {"busy": False, "current": "", "last_result": ""}
+STATE = {"busy": False, "current": "", "last_result": "",
+         "step": "", "done": 0, "total": 0, "container": ""}
 
 
 # --------------------------------------------------------------------------- #
@@ -85,6 +86,39 @@ def run(cmd, timeout=None):
         return p.returncode, (p.stdout or "") + (p.stderr or "")
     except Exception as exc:  # noqa: BLE001
         return 1, str(exc)
+
+
+def run_stream(cmd, on_line, timeout=None):
+    """Run a command, streaming each output line to on_line as it is produced.
+
+    Returns (rc, full_output). Unlike run(), output is delivered live so the
+    activity log (and the GUI that polls it) updates while the job is running
+    instead of only at the end.
+    """
+    lines = []
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, bufsize=1)
+    except Exception as exc:  # noqa: BLE001
+        return 1, str(exc)
+    deadline = (time.time() + timeout) if timeout else None
+    try:
+        for line in p.stdout:
+            line = line.rstrip("\n")
+            lines.append(line)
+            try:
+                on_line(line)
+            except Exception:  # noqa: BLE001
+                pass
+            if deadline and time.time() > deadline:
+                p.kill()
+                lines.append("timed out")
+                break
+        p.wait(timeout=5)
+    except Exception as exc:  # noqa: BLE001
+        lines.append(str(exc))
+    rc = p.returncode if p.returncode is not None else 1
+    return rc, "\n".join(lines)
 
 
 def slugify(text, fallback="schedule"):
@@ -373,6 +407,32 @@ def _prune_bucket(bucket_rel, keep):
         log(f"  retention: pruned old run {bucket_rel}/{name}")
 
 
+_CONTAINER_LINE = re.compile(r"container:\s+(\S+)\s+\(project=")
+_VOLUME_LINE = re.compile(r"volume\s*->\s*(\S+)")
+
+
+def _reset_progress():
+    STATE["step"] = ""
+    STATE["done"] = 0
+    STATE["total"] = 0
+    STATE["container"] = ""
+
+
+def _backup_progress_line(line):
+    """Stream callback: log the line and update the live progress counter."""
+    log("  " + line)
+    m = _CONTAINER_LINE.search(line)
+    if m:
+        STATE["done"] = STATE.get("done", 0) + 1
+        STATE["container"] = m.group(1)
+        STATE["step"] = m.group(1)
+        return
+    mv = _VOLUME_LINE.search(line)
+    if mv:
+        cur = STATE.get("container", "")
+        STATE["step"] = f"{cur} \u00b7 volume {mv.group(1)}" if cur else f"volume {mv.group(1)}"
+
+
 def do_backup(names, bucket, retention, label, running_only=False):
     settings = load_settings()
     dest = settings["destination"]
@@ -380,17 +440,27 @@ def do_backup(names, bucket, retention, label, running_only=False):
     bucket_rel = "/".join(p for p in (dest, bucket) if p)
     run_subpath = f"{bucket_rel}/{stamp}"
     extra = ["--running"] if running_only and not names else []
+    # Estimate how many containers this run will touch, for the progress bar.
+    if names:
+        total = len(names)
+    else:
+        conts = list_containers()
+        total = (len([c for c in conts if c["state"] == "running"])
+                 if running_only else len(conts))
     with _run_lock:
         STATE["busy"] = True
         STATE["current"] = f"backup: {label}"
+        _reset_progress()
+        STATE["total"] = total
+        STATE["step"] = "starting\u2026"
         log(f"Backup started ({label}) -> {run_subpath}")
-        rc, out = run(["/usr/local/bin/backup.sh", run_subpath, *extra, *names], timeout=3600)
-        for ln in out.splitlines():
-            log("  " + ln)
+        rc, out = run_stream(["/usr/local/bin/backup.sh", run_subpath, *extra, *names],
+                             _backup_progress_line, timeout=3600)
         if rc == 0 and retention:
             _prune_bucket(bucket_rel, retention)
         STATE["busy"] = False
         STATE["current"] = ""
+        _reset_progress()
         STATE["last_result"] = f"backup ({label}) rc={rc} @ {now()}"
         log(f"Backup finished ({label}) rc={rc}")
     return rc, out
@@ -434,12 +504,14 @@ def do_restore(run_subpath, project=None):
     with _run_lock:
         STATE["busy"] = True
         STATE["current"] = f"restore: {desc}"
+        _reset_progress()
+        STATE["step"] = "restoring\u2026"
         log(f"Restore started ({desc})")
-        rc, out = run(["/usr/local/bin/restore.sh", *args], timeout=3600)
-        for ln in out.splitlines():
-            log("  " + ln)
+        rc, out = run_stream(["/usr/local/bin/restore.sh", *args],
+                             lambda ln: log("  " + ln), timeout=3600)
         STATE["busy"] = False
         STATE["current"] = ""
+        _reset_progress()
         STATE["last_result"] = f"restore ({desc}) rc={rc} @ {now()}"
         log(f"Restore finished ({desc}) rc={rc}")
     return rc, out
@@ -555,6 +627,9 @@ class Handler(BaseHTTPRequestHandler):
                 "busy": STATE["busy"],
                 "current": STATE["current"],
                 "last_result": STATE["last_result"],
+                "step": STATE["step"],
+                "done": STATE["done"],
+                "total": STATE["total"],
             })
         elif path == "/api/containers":
             self._json(list_containers())
@@ -624,6 +699,10 @@ display:flex;align-items:center;gap:14px;position:sticky;top:0;z-index:5}
 header h1{font-size:17px;margin:0;font-weight:600}
 .badge{font-size:12px;padding:3px 9px;border-radius:20px;background:var(--panel2);color:var(--muted)}
 .badge.busy{background:var(--warn);color:#1a1207}.badge.idle{background:#14361f;color:var(--ok)}
+.progwrap{height:5px;background:var(--panel2);overflow:hidden}
+#progBar{height:100%;width:0;background:var(--accent);transition:width .4s ease}
+#progBar.indet{width:35%;animation:indet 1.1s ease-in-out infinite}
+@keyframes indet{0%{margin-left:-35%}100%{margin-left:100%}}
 nav{display:flex;gap:4px;padding:10px 20px 0;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
 nav button{background:none;border:none;color:var(--muted);padding:9px 16px;cursor:pointer;
 border-bottom:2px solid transparent;font-size:14px}
@@ -676,9 +755,11 @@ tr.grp b{font-size:13px}tr.member td{background:transparent}
 <header>
   <h1>🐳 Docker Backup</h1>
   <span id="statusBadge" class="badge idle">idle</span>
+  <span id="progText" class="tag"></span>
   <span id="lastResult" class="badge"></span>
   <span class="right tag" id="clock"></span>
 </header>
+<div id="progWrap" class="progwrap hidden"><div id="progBar"></div></div>
 <nav>
   <button data-tab="backup" class="active">Backup</button>
   <button data-tab="restore">Restore</button>
@@ -1006,6 +1087,19 @@ function setStatus(s){
   b.textContent=s.busy?("⏳ "+(s.current||"working…")):"idle";
   b.className="badge "+(s.busy?"busy":"idle");
   $("#lastResult").textContent=s.last_result||"";
+  const pt=$("#progText"),pw=$("#progWrap"),pb=$("#progBar");
+  if(s.busy){
+    pw.classList.remove("hidden");
+    if(s.total){
+      const pct=Math.min(100,Math.round((s.done/s.total)*100));
+      pb.classList.remove("indet");pb.style.width=pct+"%";
+      pt.textContent=`${s.done}/${s.total}`+(s.step?" — "+s.step:"");
+    }else{
+      pb.classList.add("indet");pt.textContent=s.step||s.current||"working…";
+    }
+  }else{
+    pw.classList.add("hidden");pb.classList.remove("indet");pb.style.width="0";pt.textContent="";
+  }
   ["btnBackupSel","btnBackupAll"].forEach(id=>{const e=$("#"+id);if(e)e.disabled=s.busy});
 }
 async function refresh(){
@@ -1028,10 +1122,12 @@ setInterval(()=>{const n=new Date();const p=x=>String(x).padStart(2,"0");
   $("#clock").textContent=p(n.getDate())+"."+p(n.getMonth()+1)+"."+n.getFullYear()+" "+p(n.getHours())+":"+p(n.getMinutes())+":"+p(n.getSeconds())},1000);
 let _wasBusy=false;
 setInterval(async()=>{try{const s=await api("/api/state");setStatus(s);
+  // while busy, keep the Logs tab live so progress is visible there too
+  if(s.busy && !$("#tab-logs").classList.contains("hidden"))loadLogs();
   // when a backup/restore finishes, refresh the Restore list in the background
   if(_wasBusy&&!s.busy){renderRuns(s.runs);}
   _wasBusy=!!s.busy;
-}catch(e){}},4000);
+}catch(e){}},2000);
 setInterval(()=>{if($("#autoLog")?.checked && !$("#tab-logs").classList.contains("hidden"))loadLogs()},5000);
 refresh();
 </script>

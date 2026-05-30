@@ -173,6 +173,11 @@ schedule's **Save** button.
   many manual backups to keep.
 - **Logs** — live activity log.
 
+While a backup or restore is running, the header shows a **live progress bar**
+with a `done / total` container count and the item currently being processed
+(for example `14/24 — sonarr · volume remote_movies`). The activity log streams
+each step in real time, so you can watch progress on the **Logs** tab too.
+
 ## What gets backed up
 
 For each container: a details file (`inspect.json`), all its data volumes
