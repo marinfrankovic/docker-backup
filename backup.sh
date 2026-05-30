@@ -187,8 +187,8 @@ archive_binds() { # <cid> <cdest> <chost>
     done
 }
 
-copy_compose() { # <cid> <pdest>
-  cid="$1"; pdest="$2"
+copy_compose() { # <cid> <pdest> <phost>
+  cid="$1"; pdest="$2"; phost="$3"
   cfg="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' "$cid" 2>/dev/null)"
   [ -z "$cfg" ] && return 0
   wdir="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$cid" 2>/dev/null)"
@@ -206,9 +206,10 @@ copy_compose() { # <cid> <pdest>
       done
     } > "$pdest/compose.meta"
     # Back up the project's .env (a plain file in the working dir, not a mount),
-    # so compose variable interpolation works on restore.
+    # so compose variable interpolation works on restore. The helper runs on the
+    # host daemon, so its destination mount must be the HOST backup path.
     if [ -n "$wdir" ]; then
-      docker run --rm --label "$HELPER_LABEL" -v "$wdir":/src:ro -v "$pdest":/dst "$HELPER_IMAGE" \
+      docker run --rm --label "$HELPER_LABEL" -v "$wdir":/src:ro -v "$phost":/dst "$HELPER_IMAGE" \
         sh -c "[ -f /src/.env ] && cp -f /src/.env /dst/.env 2>/dev/null" 2>/dev/null || true
     fi
   fi
@@ -217,7 +218,7 @@ copy_compose() { # <cid> <pdest>
     [ -z "$f" ] && continue
     base="$(basename "$f")"
     dir="$(dirname "$f")"
-    docker run --rm --label "$HELPER_LABEL" -v "$dir":/src:ro -v "$pdest":/dst "$HELPER_IMAGE" \
+    docker run --rm --label "$HELPER_LABEL" -v "$dir":/src:ro -v "$phost":/dst "$HELPER_IMAGE" \
       sh -c "cp -f '/src/$base' '/dst/$base' 2>/dev/null" 2>/dev/null || true
   done
 }
@@ -233,13 +234,14 @@ backup_one() { # <cid>
   pdest="$DEST/$project"
   cdest="$pdest/$name"
   chost="$DESTHOST/$project/$name"
+  phost="$DESTHOST/$project"
   mkdir -p "$cdest"
   log "  container: $name (project=$project, image=$image)"
   docker inspect "$cid" > "$cdest/inspect.json" 2>/dev/null || true
   dump_database "$cid" "$name" "$image" "$cdest"
   archive_volumes "$cid" "$cdest" "$chost"
   archive_binds "$cid" "$cdest" "$chost"
-  copy_compose "$cid" "$pdest"
+  copy_compose "$cid" "$pdest" "$phost"
 }
 
 if [ "$#" -gt 0 ]; then
