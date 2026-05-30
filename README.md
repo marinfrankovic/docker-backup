@@ -175,8 +175,13 @@ schedule's **Save** button.
 
 While a backup or restore is running, the header shows a **live progress bar**
 with a `done / total` container count and the item currently being processed
-(for example `14/24 — sonarr · volume remote_movies`). The activity log streams
+(for example `14/24 — sonarr · volume config`). The activity log streams
 each step in real time, so you can watch progress on the **Logs** tab too.
+
+A red **⏹ Stop** button appears in the header while a job is running. Click it to
+cancel the current backup or restore: the tool stops the running script **and** any
+helper containers it started, then returns to idle. The interrupted run is left
+incomplete (no `_BACKUP_OK.txt`) and can be deleted from **Restore**.
 
 ## What gets backed up
 
@@ -184,6 +189,20 @@ For each container: a details file (`inspect.json`), all its data volumes
 (`volume-*.tar.gz`), its databases (saved with `mysqldump` / `pg_dumpall`,
 compressed), and its compose file. A `_BACKUP_OK.txt` file marks a finished
 backup.
+
+**Large media libraries are skipped by default.** Volumes whose names look like
+media content (movies, TV/shows/series, music, anime, downloads/torrents, or any
+`remote_*` volume) are **not** archived, so backups stay small and fast and your
+USB drive doesn't fill up with media you already have elsewhere. The default
+skip patterns are:
+
+```
+*movies* *movie* *tv* *shows* *series* *media* *music* *anime* *downloads* *torrents* remote_*
+```
+
+To change them, set the `EXCLUDE_VOLUME_PATTERNS` environment variable on the
+`docker-backup` service (space-separated shell globs). Set it to an empty string
+to back up every volume.
 
 Databases are saved two ways — as a database dump **and** inside the volume copy
 — so you have two ways to recover. Stopped containers skip the live database dump,

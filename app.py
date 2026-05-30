@@ -28,6 +28,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -59,8 +60,10 @@ WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]  # Python week
 _run_lock = threading.Lock()      # only one backup/restore at a time
 _log_lock = threading.Lock()
 _cfg_lock = threading.Lock()      # serialise config reads/writes
+_proc_lock = threading.Lock()     # guards the handle to the running child process
+_current_proc = {"p": None}       # Popen of the in-flight backup/restore, or None
 STATE = {"busy": False, "current": "", "last_result": "",
-         "step": "", "done": 0, "total": 0, "container": ""}
+         "step": "", "done": 0, "total": 0, "container": "", "stopping": False}
 
 
 # --------------------------------------------------------------------------- #
@@ -97,10 +100,15 @@ def run_stream(cmd, on_line, timeout=None):
     """
     lines = []
     try:
+        # start_new_session puts the child in its own process group so a Stop
+        # request can signal the whole tree (backup.sh + any docker clients).
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT, text=True, bufsize=1)
+                             stderr=subprocess.STDOUT, text=True, bufsize=1,
+                             start_new_session=True)
     except Exception as exc:  # noqa: BLE001
         return 1, str(exc)
+    with _proc_lock:
+        _current_proc["p"] = p
     deadline = (time.time() + timeout) if timeout else None
     try:
         for line in p.stdout:
@@ -117,8 +125,40 @@ def run_stream(cmd, on_line, timeout=None):
         p.wait(timeout=5)
     except Exception as exc:  # noqa: BLE001
         lines.append(str(exc))
+    finally:
+        with _proc_lock:
+            _current_proc["p"] = None
     rc = p.returncode if p.returncode is not None else 1
     return rc, "\n".join(lines)
+
+
+def stop_current():
+    """Terminate the in-flight backup/restore and clean up helper containers.
+
+    Signals the child process group (backup.sh and any docker CLI it spawned)
+    and force-removes the labelled helper containers doing the actual volume
+    archiving, so the job stops promptly instead of waiting on a large tar.
+    """
+    with _proc_lock:
+        p = _current_proc.get("p")
+    if p is None or p.poll() is not None:
+        return False, "nothing is running"
+    STATE["stopping"] = True
+    STATE["step"] = "stopping\u2026"
+    log("Stop requested \u2014 terminating current job")
+    try:
+        os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+    except Exception:  # noqa: BLE001
+        try:
+            p.terminate()
+        except Exception:  # noqa: BLE001
+            pass
+    # Remove helper containers (volume tar / compose copy) spawned by backup.sh.
+    rc, out = run(["docker", "ps", "--filter", "label=docker-backup-helper=1", "-q"],
+                  timeout=30)
+    for cid in out.split():
+        run(["docker", "rm", "-f", cid], timeout=30)
+    return True, "stop signal sent"
 
 
 def slugify(text, fallback="schedule"):
@@ -416,6 +456,7 @@ def _reset_progress():
     STATE["done"] = 0
     STATE["total"] = 0
     STATE["container"] = ""
+    STATE["stopping"] = False
 
 
 def _backup_progress_line(line):
@@ -630,6 +671,7 @@ class Handler(BaseHTTPRequestHandler):
                 "step": STATE["step"],
                 "done": STATE["done"],
                 "total": STATE["total"],
+                "stopping": STATE["stopping"],
             })
         elif path == "/api/containers":
             self._json(list_containers())
@@ -663,6 +705,9 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=do_restore, args=(run_subpath, project),
                              daemon=True).start()
             self._json({"ok": True, "started": run_subpath})
+        elif path == "/api/stop":
+            ok, msg = stop_current()
+            self._json({"ok": ok, "message": msg}, 200 if ok else 409)
         elif path == "/api/delete":
             rc, msg = delete_path(str(body.get("run", "")))
             self._json({"ok": rc == 0, "message": msg}, 200 if rc == 0 else 400)
@@ -756,6 +801,7 @@ tr.grp b{font-size:13px}tr.member td{background:transparent}
   <h1>🐳 Docker Backup</h1>
   <span id="statusBadge" class="badge idle">idle</span>
   <span id="progText" class="tag"></span>
+  <button id="btnStop" class="btn danger sm hidden" onclick="stopJob()">⏹ Stop</button>
   <span id="lastResult" class="badge"></span>
   <span class="right tag" id="clock"></span>
 </header>
@@ -921,6 +967,11 @@ async function backup(names){
 const backupSelected=()=>{const s=selected();if(!s.length)return toast("Select at least one container");backup(s)};
 const backupAll=()=>backup([]);
 const backupOne=n=>backup([n]);
+async function stopJob(){
+  if(!confirm("Stop the current backup/restore?\nThe in-progress run is incomplete and will be discarded."))return;
+  try{const r=await api("/api/stop",{method:"POST"});toast(r.message||"stopping\u2026");setTimeout(refresh,600);
+  }catch(e){toast("Error: "+e.message)}
+}
 
 /* ---------------- Restore ---------------- */
 function renderRuns(runs){
@@ -1087,9 +1138,10 @@ function setStatus(s){
   b.textContent=s.busy?("⏳ "+(s.current||"working…")):"idle";
   b.className="badge "+(s.busy?"busy":"idle");
   $("#lastResult").textContent=s.last_result||"";
-  const pt=$("#progText"),pw=$("#progWrap"),pb=$("#progBar");
+  const pt=$("#progText"),pw=$("#progWrap"),pb=$("#progBar"),bs=$("#btnStop");
   if(s.busy){
     pw.classList.remove("hidden");
+    if(bs){bs.classList.remove("hidden");bs.disabled=!!s.stopping;bs.textContent=s.stopping?"⏹ Stopping…":"⏹ Stop";}
     if(s.total){
       const pct=Math.min(100,Math.round((s.done/s.total)*100));
       pb.classList.remove("indet");pb.style.width=pct+"%";
@@ -1099,6 +1151,7 @@ function setStatus(s){
     }
   }else{
     pw.classList.add("hidden");pb.classList.remove("indet");pb.style.width="0";pt.textContent="";
+    if(bs)bs.classList.add("hidden");
   }
   ["btnBackupSel","btnBackupAll"].forEach(id=>{const e=$("#"+id);if(e)e.disabled=s.busy});
 }

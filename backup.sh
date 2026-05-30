@@ -24,8 +24,25 @@ BACKUP_ROOT_CONTAINER="${BACKUP_ROOT_CONTAINER:-/backups}"
 BACKUP_ROOT_HOST="${BACKUP_ROOT_HOST:?Set BACKUP_ROOT_HOST to the host path of the backups dir}"
 HELPER_IMAGE="${HELPER_IMAGE:-alpine:3.20}"
 SELF_NAME="${SELF_NAME:-docker-backup}"
+HELPER_LABEL="docker-backup-helper=1"
+
+# Volumes whose names match any of these space-separated glob patterns are NEVER
+# archived. These are large media-library content volumes (movies / TV / music /
+# downloads) that must be backed up separately, not bundled into app backups.
+# Override with EXCLUDE_VOLUME_PATTERNS="" to disable, or a custom list.
+EXCLUDE_VOLUME_PATTERNS="${EXCLUDE_VOLUME_PATTERNS-*movies* *movie* *tv* *shows* *series* *media* *music* *anime* *downloads* *torrents* remote_*}"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+is_excluded_volume() { # <volume-name> -> 0 if it should be skipped
+  _v="$1"
+  for _pat in $EXCLUDE_VOLUME_PATTERNS; do
+    case "$_v" in
+      $_pat) return 0 ;;
+    esac
+  done
+  return 1
+}
 
 [ "$#" -ge 1 ] || { echo "usage: backup.sh <run_subpath> [--running | container...]" >&2; exit 2; }
 RUN_SUBPATH="$1"; shift
@@ -99,8 +116,12 @@ archive_volumes() { # <cid> <cdest> <chost>
   docker inspect -f '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{println}}{{end}}{{end}}' "$cid" \
   | while read -r vol; do
       [ -z "$vol" ] && continue
+      if is_excluded_volume "$vol"; then
+        log "    skip volume $vol (excluded media library)"
+        continue
+      fi
       log "    volume -> $vol"
-      if ! docker run --rm \
+      if ! docker run --rm --label "$HELPER_LABEL" \
             -v "$vol":/from:ro \
             -v "$chost":/to \
             "$HELPER_IMAGE" \
@@ -118,7 +139,7 @@ copy_compose() { # <cid> <pdest>
     [ -z "$f" ] && continue
     base="$(basename "$f")"
     dir="$(dirname "$f")"
-    docker run --rm -v "$dir":/src:ro -v "$pdest":/dst "$HELPER_IMAGE" \
+    docker run --rm --label "$HELPER_LABEL" -v "$dir":/src:ro -v "$pdest":/dst "$HELPER_IMAGE" \
       sh -c "cp -f '/src/$base' '/dst/$base' 2>/dev/null" 2>/dev/null || true
   done
 }
