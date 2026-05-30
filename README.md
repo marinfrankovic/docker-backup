@@ -216,10 +216,17 @@ Where files land on disk:
 
 ## Restoring (how it works)
 
-Restoring **overwrites current data**. For the project (or whole run) you pick,
-the tool: stops its containers → replaces each data volume with the backup →
-starts them again (databases first) → re-imports the database dump only where the
-volume copy didn't already cover it. Only one backup or restore runs at a time.
+Restoring **overwrites current data**. You can restore at three levels:
+
+- **Whole run** — every project captured in that backup.
+- **One project** — only the containers of a single compose project.
+- **One container** — just a single container inside a project (expand the run on
+  the **Restore** tab and use the **Restore container** button next to its name).
+
+For whatever you pick, the tool: stops the affected container(s) → replaces each
+data volume with the backup → starts them again (databases first) → re-imports the
+database dump only where the volume copy didn't already cover it. Only one backup
+or restore runs at a time.
 
 You can also do it from the terminal (the web page does the same):
 ```bash
@@ -227,6 +234,7 @@ docker exec docker-backup backup.sh _manual/now              # back up all
 docker exec docker-backup backup.sh _manual/now --running    # only running
 docker exec docker-backup restore.sh --list                  # list backups
 docker exec docker-backup restore.sh _manual/2026-05-29_141500 <project>
+docker exec docker-backup restore.sh _manual/2026-05-29_141500 <project> <container>
 ```
 
 ## If your computer breaks (disaster recovery)

@@ -11,12 +11,14 @@
 #       so a second SQL import is skipped to avoid conflicts)
 #
 # Usage:
-#   restore.sh <run_subpath> [project]   # restore all projects, or just <project>
+#   restore.sh <run_subpath> [project] [container]   # whole run, one project, or one container
 #   restore.sh --list                    # list runs/projects found on disk
 #
 #   run_subpath : path of the backup run, RELATIVE to the backups root, e.g.
 #                 "prod/sched-a1b2/2026-05-29_030000". Legacy day folders such as
 #                 "2026-05-26" also work.
+#   project     : restore only this compose project from the run.
+#   container   : with a project, restore only this one container from it.
 set -u
 
 BACKUP_ROOT_CONTAINER="${BACKUP_ROOT_CONTAINER:-/backups}"
@@ -38,6 +40,7 @@ fi
 
 RUN_SUBPATH="$1"
 FILTER="${2:-}"
+CONTAINER_FILTER="${3:-}"
 RUN="$BACKUP_ROOT_CONTAINER/$RUN_SUBPATH"
 RUNHOST="$BACKUP_ROOT_HOST/$RUN_SUBPATH"
 [ -d "$RUN" ] || { log "No such backup run: $RUN_SUBPATH (try: restore.sh --list)"; exit 1; }
@@ -45,6 +48,11 @@ RUNHOST="$BACKUP_ROOT_HOST/$RUN_SUBPATH"
 exists()   { docker inspect "$1" >/dev/null 2>&1; }
 running()  { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = "true" ]; }
 is_db()    { case "$1" in *mysql*|*mariadb*|*postgres*) return 0 ;; *) return 1 ;; esac; }
+container_selected() { # <cname> -> 0 if it should be restored (honours CONTAINER_FILTER)
+  [ -z "$CONTAINER_FILTER" ] && return 0
+  [ "$1" = "$CONTAINER_FILTER" ] && return 0
+  return 1
+}
 img_of()   { docker inspect -f '{{.Config.Image}}' "$1" 2>/dev/null; }
 env_of()   { docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$1" 2>/dev/null \
                | grep -E "^$2=" | head -1 | cut -d= -f2-; }
@@ -55,16 +63,23 @@ restore_project() { # <project_name>
   basehost="$RUNHOST/$project"
   [ -d "$base" ] || { log "  no data for project '$project' in run; skipping"; return 0; }
 
-  log "Restoring project '$project' from '$RUN_SUBPATH' (end-to-end overwrite)"
+  if [ -n "$CONTAINER_FILTER" ]; then
+    [ -d "$base/$CONTAINER_FILTER" ] || { log "  no data for container '$CONTAINER_FILTER' in project '$project'; skipping"; return 0; }
+    log "Restoring container '$CONTAINER_FILTER' (project '$project') from '$RUN_SUBPATH' (overwrite)"
+  else
+    log "Restoring project '$project' from '$RUN_SUBPATH' (end-to-end overwrite)"
+  fi
 
   # Collect the container names to act on: those captured in the backup, plus any
   # live container that still shares this compose project (e.g. one-shot helpers).
   cnames=""
   for cdir in "$base"/*/; do
     [ -d "$cdir" ] || continue
-    cnames="$cnames $(basename "$cdir")"
+    cn="$(basename "$cdir")"
+    container_selected "$cn" || continue
+    cnames="$cnames $cn"
   done
-  if [ "$project" != "_standalone" ]; then
+  if [ "$project" != "_standalone" ] && [ -z "$CONTAINER_FILTER" ]; then
     for n in $(docker ps -a --filter "label=com.docker.compose.project=$project" --format '{{.Names}}' 2>/dev/null); do
       case " $cnames " in *" $n "*) ;; *) cnames="$cnames $n" ;; esac
     done
@@ -84,6 +99,7 @@ restore_project() { # <project_name>
   for cdir in "$base"/*/; do
     [ -d "$cdir" ] || continue
     cname="$(basename "$cdir")"
+    container_selected "$cname" || continue
     chost="$basehost/$cname"
     for arc in "$cdir"volume-*.tar.gz; do
       [ -f "$arc" ] || continue
@@ -121,6 +137,7 @@ restore_project() { # <project_name>
   for cdir in "$base"/*/; do
     [ -d "$cdir" ] || continue
     cname="$(basename "$cdir")"
+    container_selected "$cname" || continue
 
     sql=""
     for s in "$cdir"all-databases.sql.gz "$cdir"*.sql.gz; do

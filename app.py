@@ -533,15 +533,21 @@ def _valid_run(rel):
     return target is not None and os.path.isfile(os.path.join(target, "_BACKUP_OK.txt"))
 
 
-def do_restore(run_subpath, project=None):
+def do_restore(run_subpath, project=None, container=None):
     if not _valid_run(run_subpath):
         return 1, "invalid or unknown backup run"
     if project and not NAME_RE.match(project):
         return 1, "invalid project name"
+    if container and not NAME_RE.match(container):
+        return 1, "invalid container name"
+    if container and not project:
+        return 1, "container restore requires a project"
     args = [run_subpath]
     if project:
         args.append(project)
-    desc = run_subpath + (f"/{project}" if project else "")
+    if container:
+        args.append(container)
+    desc = run_subpath + (f"/{project}" if project else "") + (f"/{container}" if container else "")
     with _run_lock:
         STATE["busy"] = True
         STATE["current"] = f"restore: {desc}"
@@ -700,9 +706,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "busy", "current": STATE["current"]}, 409)
             run_subpath = str(body.get("run", ""))
             project = body.get("project") or None
+            container = body.get("container") or None
             if not _valid_run(run_subpath):
                 return self._json({"ok": False, "message": "invalid backup run"}, 400)
-            threading.Thread(target=do_restore, args=(run_subpath, project),
+            threading.Thread(target=do_restore, args=(run_subpath, project, container),
                              daemon=True).start()
             self._json({"ok": True, "started": run_subpath})
         elif path == "/api/stop":
@@ -786,6 +793,7 @@ summary{cursor:pointer;font-weight:600}details{margin:6px 0}
 .dayGroup>details{margin-left:14px}
 tr.grp td{background:var(--panel2);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
 tr.grp b{font-size:13px}tr.member td{background:transparent}
+tr.ctnRow td{background:transparent;color:var(--muted);font-size:12px;border-bottom:1px dashed var(--line)}
 .caret{display:inline-block;width:16px;text-align:center;cursor:pointer;color:var(--muted);user-select:none;margin-right:4px}
 .stackName{cursor:pointer;user-select:none}.stackName:hover{text-decoration:underline}
 .sched{border:1px solid var(--line);border-radius:9px;padding:14px;margin-bottom:12px;background:var(--panel2)}
@@ -998,13 +1006,22 @@ function renderRuns(runs){
     dayWrap.appendChild(head);
     day.runs.forEach(r=>{
       const det=document.createElement("details");
-      const rows=r.projects.map(p=>`<tr>
-        <td><b>${esc(p.name)}</b><div class=tag>${esc(p.containers.join(", "))}</div></td>
+      const rows=r.projects.map(p=>{
+        const ctnRows=(p.containers||[]).map(c=>`<tr class=ctnRow>
+          <td style="padding-left:22px">↳ ${esc(c)}</td>
+          <td class=tag></td>
+          <td></td>
+          <td class=right>
+            <button class="btn sec sm" onclick="restore('${esc(r.run)}','${esc(p.name)}','${esc(c)}')">Restore container</button>
+          </td></tr>`).join("");
+        return `<tr>
+        <td><b>${esc(p.name)}</b><div class=tag>${esc((p.containers||[]).join(", "))}</div></td>
         <td class=tag>${p.mtime?fmtTime(p.mtime):""}</td>
         <td>${fmtSize(p.size)}</td>
         <td class=right>
-          <button class="btn sm" onclick="restore('${esc(r.run)}','${esc(p.name)}')">Restore project</button>
-        </td></tr>`).join("");
+          <button class="btn sm" onclick="restore('${esc(r.run)}','${esc(p.name)}',null)">Restore project</button>
+        </td></tr>${ctnRows}`;
+      }).join("");
       det.innerHTML=`<summary><span class=tag>${r.mtime?fmtTime(r.mtime):""}</span> &nbsp;${esc(r.label)}
         <span class=tag>${fmtSize(r.size)}</span>
         <button class="btn sm" style="margin-left:10px" onclick="event.preventDefault();restore('${esc(r.run)}',null)">Restore whole run</button>
@@ -1015,11 +1032,11 @@ function renderRuns(runs){
     el.appendChild(dayWrap);
   });
 }
-async function restore(run,project){
-  const what=project?`project "${project}"`:"the whole run";
-  if(!confirm(`Restore ${what} from\n${run}?\n\nThis stops the affected stack(s), overwrites their volumes with the backup, starts the containers again, and re-imports databases where needed. Current data is replaced.`))return;
+async function restore(run,project,container){
+  const what=container?`container "${container}"`:(project?`project "${project}"`:"the whole run");
+  if(!confirm(`Restore ${what} from\n${run}?\n\nThis stops the affected container(s), overwrites their volumes with the backup, starts them again, and re-imports databases where needed. Current data is replaced.`))return;
   try{await api("/api/restore",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({run,project})});toast("Restore started");setTimeout(refresh,800);
+    body:JSON.stringify({run,project,container})});toast("Restore started");setTimeout(refresh,800);
   }catch(e){toast("Error: "+e.message)}
 }
 async function del(run){
