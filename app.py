@@ -146,7 +146,8 @@ def _default_schedule():
         "time": f"{DEFAULT_HOUR:02d}:00",
         "weekdays": [0, 1, 2, 3, 4, 5, 6],   # used when frequency == weekly
         "day_of_month": 1,                   # used when frequency == monthly
-        "containers": [],                    # [] / "all" => all running
+        "mode": "all",                       # all | selected | running
+        "containers": [],                    # used only when mode == selected
         "retention": DEFAULT_RETENTION,      # keep last N runs of this schedule
     }
 
@@ -177,10 +178,15 @@ def _normalise_schedule(s, existing_ids):
     if isinstance(dom, int) and 1 <= dom <= 31:
         out["day_of_month"] = dom
     cs = s.get("containers")
-    if cs in ("all", None) or cs == []:
-        out["containers"] = []
-    elif isinstance(cs, list):
+    if isinstance(cs, list):
         out["containers"] = [c for c in (str(x).strip() for x in cs) if NAME_RE.match(c)]
+    else:
+        out["containers"] = []
+    mode = str(s.get("mode", "")).lower()
+    if mode not in ("all", "selected", "running"):
+        # backward compat: old schedules only stored containers ([] == everything)
+        mode = "selected" if out["containers"] else "all"
+    out["mode"] = mode
     ret = s.get("retention")
     if isinstance(ret, int) and 1 <= ret <= 999:
         out["retention"] = ret
@@ -367,17 +373,18 @@ def _prune_bucket(bucket_rel, keep):
         log(f"  retention: pruned old run {bucket_rel}/{name}")
 
 
-def do_backup(names, bucket, retention, label):
+def do_backup(names, bucket, retention, label, running_only=False):
     settings = load_settings()
     dest = settings["destination"]
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     bucket_rel = "/".join(p for p in (dest, bucket) if p)
     run_subpath = f"{bucket_rel}/{stamp}"
+    extra = ["--running"] if running_only and not names else []
     with _run_lock:
         STATE["busy"] = True
         STATE["current"] = f"backup: {label}"
         log(f"Backup started ({label}) -> {run_subpath}")
-        rc, out = run(["/usr/local/bin/backup.sh", run_subpath, *names], timeout=3600)
+        rc, out = run(["/usr/local/bin/backup.sh", run_subpath, *extra, *names], timeout=3600)
         for ln in out.splitlines():
             log("  " + ln)
         if rc == 0 and retention:
@@ -391,14 +398,23 @@ def do_backup(names, bucket, retention, label):
 
 def do_manual_backup(names):
     settings = load_settings()
-    label = "all running" if not names else ", ".join(names)
+    label = "all containers" if not names else ", ".join(names)
     return do_backup(names, "_manual", settings["manual_retention"], label)
 
 
 def do_scheduled_backup(sched):
-    names = sched["containers"] if sched["containers"] else []
+    mode = sched.get("mode", "all")
     label = f"schedule '{sched['name']}'"
-    return do_backup(names, sched["id"], sched["retention"], label)
+    if mode == "selected":
+        names = sched["containers"]
+        if not names:
+            log(f"Backup skipped ({label}): mode 'selected' but no containers chosen")
+            STATE["last_result"] = f"backup ({label}) skipped: no containers @ {now()}"
+            return 0, "no containers selected"
+        return do_backup(names, sched["id"], sched["retention"], label)
+    if mode == "running":
+        return do_backup([], sched["id"], sched["retention"], label, running_only=True)
+    return do_backup([], sched["id"], sched["retention"], label)
 
 
 def _valid_run(rel):
@@ -561,7 +577,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "busy", "current": STATE["current"]}, 409)
             names = [n for n in body.get("containers", []) if NAME_RE.match(str(n))]
             threading.Thread(target=do_manual_backup, args=(names,), daemon=True).start()
-            self._json({"ok": True, "started": names or "all running"})
+            self._json({"ok": True, "started": names or "all containers"})
         elif path == "/api/restore":
             if STATE["busy"]:
                 return self._json({"error": "busy", "current": STATE["current"]}, 409)
@@ -679,7 +695,7 @@ tr.grp b{font-size:13px}tr.member td{background:transparent}
         <div class="right row">
           <button class="btn sec sm" onclick="refresh()">↻ Refresh</button>
           <button class="btn" id="btnBackupSel" onclick="backupSelected()">Back up selected</button>
-          <button class="btn sec" id="btnBackupAll" onclick="backupAll()">Back up all running</button>
+          <button class="btn sec" id="btnBackupAll" onclick="backupAll()">Back up all containers</button>
         </div>
       </div>
       <table>
@@ -750,7 +766,6 @@ const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 let CT=[], SCHEDS=[], SETTINGS={}, WD=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
 let SCH_COLLAPSED=new Set();
 let SCH_INIT=false;
-let SCH_EXPLICIT=new Set();
 let SCH_BASELINE={};
 function schSnapshot(){SCH_BASELINE={};SCHEDS.forEach(s=>{SCH_BASELINE[s.id]=JSON.stringify(s)})}
 function schDirty(s){return SCH_BASELINE[s.id]!==JSON.stringify(s)}
@@ -819,7 +834,7 @@ function selected(){return $$(".csel").filter(x=>x.checked).map(x=>x.value)}
 async function backup(names){
   try{await api("/api/backup",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({containers:names})});
-    toast("Backup started: "+(names.length?names.join(", "):"all running"));setTimeout(refresh,800);
+    toast("Backup started: "+(names.length?names.join(", "):"all containers"));setTimeout(refresh,800);
   }catch(e){toast("Error: "+e.message)}
 }
 const backupSelected=()=>{const s=selected();if(!s.length)return toast("Select at least one container");backup(s)};
@@ -887,14 +902,14 @@ function renderSchedules(){
   const el=$("#scheds");el.innerHTML="";
   if(!SCHEDS.length){el.innerHTML='<p class=muted>No schedules. Add one to enable automatic backups.</p>'}
   SCHEDS.forEach((s,idx)=>{
-    const allSel=!SCH_EXPLICIT.has(s.id)&&(!s.containers||s.containers.length===0);
+    const mode=s.mode||'all';const isSel=mode==='selected';
     const groups={};CT.forEach(c=>{(groups[c.project]=groups[c.project]||[]).push(c)});
     const opts=Object.keys(groups).sort().map(proj=>{
-      const chips=groups[proj].map(c=>`<label class="chip ${(!allSel&&s.containers.includes(c.name))?'on':''}">
-        <input type=checkbox ${(!allSel&&s.containers.includes(c.name))?'checked':''}
+      const chips=groups[proj].map(c=>`<label class="chip ${(isSel&&s.containers.includes(c.name))?'on':''}">
+        <input type=checkbox ${(isSel&&s.containers.includes(c.name))?'checked':''}
           onchange="schCtn(${idx},'${esc(c.name)}',this.checked)"> ${esc(c.name)}</label>`).join(" ");
       const projNames=groups[proj].map(c=>c.name);
-      const projSel=!allSel&&projNames.every(n=>s.containers.includes(n));
+      const projSel=isSel&&projNames.every(n=>s.containers.includes(n));
       return `<div class="sched-proj">
         <div class="row" style="margin-bottom:4px">
           <span class=tag>${esc(proj)}</span>
@@ -910,7 +925,7 @@ function renderSchedules(){
     const dirty=schDirty(s);
     const freqLabel=s.frequency==='weekly'?`weekly · ${(s.weekdays||[]).map(i=>WD[i]).join(',')||'no days'}`
       :s.frequency==='monthly'?`monthly · day ${s.day_of_month}`:'daily';
-    const ctnLabel=allSel?'all running':`${s.containers.length} container${s.containers.length===1?'':'s'}`;
+    const ctnLabel=mode==='all'?'all containers':mode==='running'?'all running':`${s.containers.length} container${s.containers.length===1?'':'s'}`;
     div.innerHTML=`
       <div class="row sched-head" onclick="schToggle('${esc(s.id)}',event)" style="cursor:pointer">
         <span class="sched-caret">${collapsed?'\u25b6':'\u25bc'}</span>
@@ -940,9 +955,11 @@ function renderSchedules(){
       </div>
       ${s.frequency==="weekly"?`<div style="margin-top:10px"><div class=tag style="margin-bottom:4px">Days of week</div><div class="row">${wdChips}</div></div>`:""}
       <div style="margin-top:12px">
-        <div class="row" style="margin-bottom:6px"><div class=tag>Containers</div>
-          <label class="chip ${allSel?'on':''}"><input type=checkbox ${allSel?'checked':''} onchange="schAll(${idx},this.checked)"> All running</label></div>
-        <div class="row" ${allSel?'style="opacity:.45;pointer-events:none"':''}>${opts||'<span class=muted>no containers</span>'}</div>
+        <div class="row" style="margin-bottom:6px"><div class=tag>Scope</div>
+          <label class="chip ${mode==='all'?'on':''}"><input type=radio name="schmode_${esc(s.id)}" ${mode==='all'?'checked':''} onchange="schMode(${idx},'all')"> All</label>
+          <label class="chip ${mode==='selected'?'on':''}"><input type=radio name="schmode_${esc(s.id)}" ${mode==='selected'?'checked':''} onchange="schMode(${idx},'selected')"> Selected</label>
+          <label class="chip ${mode==='running'?'on':''}"><input type=radio name="schmode_${esc(s.id)}" ${mode==='running'?'checked':''} onchange="schMode(${idx},'running')"> All Running</label></div>
+        ${isSel?`<div class="row">${opts||'<span class=muted>no containers</span>'}</div>`:''}
       </div>
       </div>`;
     el.appendChild(div);
@@ -950,15 +967,15 @@ function renderSchedules(){
 }
 function schToggle(id,ev){if(ev)ev.stopPropagation();
   if(SCH_COLLAPSED.has(id))SCH_COLLAPSED.delete(id);else SCH_COLLAPSED.add(id);renderSchedules()}
-function schAll(idx,on){const s=SCHEDS[idx];if(on)SCH_EXPLICIT.delete(s.id);else SCH_EXPLICIT.add(s.id);s.containers=[];renderSchedules()}
+function schMode(idx,mode){const s=SCHEDS[idx];s.mode=mode;renderSchedules()}
 function schProj(idx,proj,on){const s=SCHEDS[idx];const projNames=CT.filter(c=>c.project===proj).map(c=>c.name);
-  SCH_EXPLICIT.add(s.id);let set=new Set(s.containers||[]);
+  s.mode='selected';let set=new Set(s.containers||[]);
   projNames.forEach(n=>{if(on)set.add(n);else set.delete(n)});s.containers=[...set];renderSchedules()}
-function schCtn(idx,name,on){const s=SCHEDS[idx];SCH_EXPLICIT.add(s.id);let set=new Set(s.containers||[]);
+function schCtn(idx,name,on){const s=SCHEDS[idx];s.mode='selected';let set=new Set(s.containers||[]);
   if(on)set.add(name);else set.delete(name);s.containers=[...set];renderSchedules()}
 function schWd(idx,day,on){const s=SCHEDS[idx];let set=new Set(s.weekdays);if(on)set.add(day);else set.delete(day);s.weekdays=[...set].sort((a,b)=>a-b);renderSchedules()}
 function addSchedule(){SCHEDS.push({id:"sched-"+Date.now().toString(36),name:"New backup",enabled:true,
-  frequency:"daily",time:"03:00",weekdays:[0,1,2,3,4,5,6],day_of_month:1,containers:[],retention:7});renderSchedules()}
+  frequency:"daily",time:"03:00",weekdays:[0,1,2,3,4,5,6],day_of_month:1,mode:"all",containers:[],retention:7});renderSchedules()}
 function rmSchedule(idx){
   if(schDirty(SCHEDS[idx])&&!confirm("This schedule has unsaved changes. Remove it anyway?"))return;
   SCHEDS.splice(idx,1);renderSchedules()}

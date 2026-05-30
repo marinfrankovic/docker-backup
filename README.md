@@ -2,7 +2,8 @@
 
 A self-contained, always-running container that backs up the other Docker
 containers on this machine to disk. You define **multiple schedules** — each with
-its own frequency (daily / weekly / monthly), set of containers, and retention —
+its own frequency (daily / weekly / monthly), scope (all containers, a selected
+set, or only running ones), and retention —
 and the tool keeps the most recent runs per schedule and prunes the rest. New
 stacks/containers are picked up automatically. A built-in **web GUI** lets you
 run manual backups, manage schedules, and restore — all from the browser.
@@ -61,7 +62,7 @@ Use this the **first time** you set the tool up on a machine.
    runs). You edit these later from the GUI.
 5. **Open the GUI** at **http://127.0.0.1:8088**.
 6. **Run a first backup** to confirm everything works: on the **Backup** tab
-   click *Back up all running* (lands in the `_manual` bucket), then check it
+   click *Back up all containers* (lands in the `_manual` bucket), then check it
    appears under **Restore → Backup runs found**.
 7. **Create your schedule(s)** on the **Schedules** tab — adjust the seeded
    schedule or add new ones, then click that schedule's **Save** button.
@@ -75,7 +76,7 @@ corner shows the current local date and time (`DD.MM.YYYY` with 24-hour clock).
 Five tabs:
 
 - **Backup** — live list of all containers (any state). Back up selected ones,
-  one container, a whole stack, or all running containers with a click. Click a
+  one container, a whole stack, or all containers with a click. Click a
   stack's name (📦) to select/deselect all containers in that stack at once.
   Manual backups land in the `_manual` bucket.
 - **Restore** — lists every completed backup run found under the root, **grouped
@@ -90,12 +91,14 @@ Five tabs:
   background** as soon as a backup finishes, so newly completed runs appear
   without reloading the page.
 - **Schedules** — add/remove schedules. Each tile is collapsed by default with a
-  summary in its header; expand one to edit it. Containers are grouped by project
-  (toggle a whole project or individual containers). Each schedule has a name,
-  frequency, time, container selection (all-running or explicit), and a "keep
-  last N runs" retention. Each schedule has its **own Save button**; unsaved edits
-  are flagged and you are warned before leaving the tab or page. Saved to
-  `E:\Docker\backups\_config\schedules.json`.
+  summary in its header; expand one to edit it. Each schedule has a **scope** with
+  three options (in order): **All** (every container, running or stopped),
+  **Selected** (pick which projects/containers to include — grouped by project,
+  toggle a whole project or individual containers), and **All Running** (only
+  containers running at backup time). Each schedule also has a name, frequency,
+  time, and a "keep last N runs" retention. Each schedule has its **own Save
+  button**; unsaved edits are flagged and you are warned before leaving the tab or
+  page. Saved to `E:\Docker\backups\_config\schedules.json`.
 - **Settings** — the backups root, an optional **destination subfolder** under
   the root for new runs, and the manual-backup retention. Saved to
   `E:\Docker\backups\_config\settings.json`.
@@ -103,7 +106,7 @@ Five tabs:
 
 ## What gets backed up
 
-Per running container:
+Per container (running **or** stopped):
 
 | Item | File |
 |------|------|
@@ -115,7 +118,9 @@ Per running container:
 | Completion marker | `_BACKUP_OK.txt` (at the run folder; marks a discoverable run) |
 
 Databases are dumped logically **and** their volumes archived, giving you two
-recovery paths.
+recovery paths. For a **stopped** container the live SQL dump is skipped (it
+can't be queried), but its named volumes are still archived, so its data is
+fully captured and restorable.
 
 ## Restore
 
@@ -153,7 +158,8 @@ docker logs -f docker-backup
 
 # Force a backup now (GUI "Back up" buttons do the same).
 # First argument is the run sub-path (relative to the root).
-docker exec docker-backup backup.sh _manual/manual-now                       # all running
+docker exec docker-backup backup.sh _manual/manual-now                       # all containers
+docker exec docker-backup backup.sh _manual/manual-now --running             # only running containers
 docker exec docker-backup backup.sh _manual/manual-now brajkovic-local-db-1  # specific container(s)
 
 # List backup runs found on disk

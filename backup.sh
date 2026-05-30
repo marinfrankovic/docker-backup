@@ -2,7 +2,8 @@
 # One-shot Docker backup into a specific run directory.
 #
 # Usage:
-#   backup.sh <run_subpath>                 # back up ALL running containers
+#   backup.sh <run_subpath>                 # back up ALL containers (running + stopped)
+#   backup.sh <run_subpath> --running       # back up only RUNNING containers
 #   backup.sh <run_subpath> <name> [name..] # back up only the named containers
 #                                           # (stopped ones: volumes + manifest only)
 #
@@ -26,8 +27,11 @@ SELF_NAME="${SELF_NAME:-docker-backup}"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
-[ "$#" -ge 1 ] || { echo "usage: backup.sh <run_subpath> [container...]" >&2; exit 2; }
+[ "$#" -ge 1 ] || { echo "usage: backup.sh <run_subpath> [--running | container...]" >&2; exit 2; }
 RUN_SUBPATH="$1"; shift
+
+RUNNING_ONLY=0
+if [ "${1:-}" = "--running" ]; then RUNNING_ONLY=1; shift; fi
 
 DEST="$BACKUP_ROOT_CONTAINER/$RUN_SUBPATH"
 DESTHOST="$BACKUP_ROOT_HOST/$RUN_SUBPATH"
@@ -145,9 +149,14 @@ if [ "$#" -gt 0 ]; then
     if [ -z "$cid" ]; then log "  WARN no such container: $arg"; continue; fi
     backup_one "$cid"
   done
-else
+elif [ "$RUNNING_ONLY" -eq 1 ]; then
   log "===== Backup start (all running) -> $DEST ====="
   for cid in $(docker ps -q); do
+    backup_one "$cid"
+  done
+else
+  log "===== Backup start (all containers) -> $DEST ====="
+  for cid in $(docker ps -aq); do
     backup_one "$cid"
   done
 fi
