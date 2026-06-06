@@ -44,7 +44,6 @@ DEFAULT_HOUR = int(os.environ.get("BACKUP_HOUR", "3"))
 CONFIG_DIR = os.path.join(BACKUP_ROOT, "_config")
 SCHEDULES_PATH = os.path.join(CONFIG_DIR, "schedules.json")
 SETTINGS_PATH = os.path.join(CONFIG_DIR, "settings.json")
-EXCLUSIONS_PATH = os.path.join(CONFIG_DIR, "exclusions.json")  # per-mount keep/skip
 LEGACY_PATH = os.path.join(CONFIG_DIR, "schedule.json")   # pre-redesign single schedule
 LOG_DIR = os.path.join(BACKUP_ROOT, "_logs")
 LOG_PATH = os.path.join(LOG_DIR, "activity.log")
@@ -137,9 +136,12 @@ def run_stream(cmd, on_line, timeout=None, env=None):
 def stop_current():
     """Terminate the in-flight backup/restore and clean up helper containers.
 
-    Signals the child process group (backup.sh and any docker CLI it spawned)
-    and force-removes the labelled helper containers doing the actual volume
-    archiving, so the job stops promptly instead of waiting on a large tar.
+    Helper containers (the detached ``docker run`` doing the actual volume tar)
+    are removed first, then the child process group is force-killed. backup.sh
+    is plain ``sh`` with no signal trap, so while it waits on a foreground
+    ``docker run`` it would otherwise defer SIGTERM until that big tar finishes
+    — leaving the job "stopping" for minutes. Removing the helper unblocks the
+    docker client and SIGKILL guarantees the script tree dies promptly.
     """
     with _proc_lock:
         p = _current_proc.get("p")
@@ -148,18 +150,28 @@ def stop_current():
     STATE["stopping"] = True
     STATE["step"] = "stopping\u2026"
     log("Stop requested \u2014 terminating current job")
+    # Remove helper containers (volume tar / compose copy) spawned by backup.sh
+    # first, so the foreground `docker run` it is blocked on returns at once.
+    # Retry briefly in case a helper is created in the same instant.
+    for _ in range(3):
+        rc, out = run(["docker", "ps", "--filter", "label=docker-backup-helper=1", "-q"],
+                      timeout=30)
+        cids = out.split() if rc == 0 else []
+        if not cids:
+            break
+        for cid in cids:
+            run(["docker", "rm", "-f", cid], timeout=30)
+        time.sleep(0.3)
+    # Force-kill the whole child process group (backup.sh + docker clients).
+    # SIGKILL rather than SIGTERM: the script has no trap and would defer a
+    # graceful signal until its current foreground command returns.
     try:
-        os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
     except Exception:  # noqa: BLE001
         try:
-            p.terminate()
+            p.kill()
         except Exception:  # noqa: BLE001
             pass
-    # Remove helper containers (volume tar / compose copy) spawned by backup.sh.
-    rc, out = run(["docker", "ps", "--filter", "label=docker-backup-helper=1", "-q"],
-                  timeout=30)
-    for cid in out.split():
-        run(["docker", "rm", "-f", cid], timeout=30)
     return True, "stop signal sent"
 
 
@@ -191,10 +203,7 @@ def _safe_subpath(rel):
 
 
 def load_settings():
-    cfg = {"destination": "", "manual_retention": 10,
-           "skip_network_mounts": False,
-           "exclude_bind_patterns": [], "exclude_volume_patterns": [],
-           "include_bind_patterns": [], "include_volume_patterns": []}
+    cfg = {"destination": "", "manual_retention": 10}
     try:
         with open(SETTINGS_PATH, encoding="utf-8") as fh:
             data = json.load(fh)
@@ -202,10 +211,6 @@ def load_settings():
         mr = data.get("manual_retention")
         if isinstance(mr, int) and 1 <= mr <= 999:
             cfg["manual_retention"] = mr
-        cfg["skip_network_mounts"] = bool(data.get("skip_network_mounts", False))
-        for key in ("exclude_bind_patterns", "exclude_volume_patterns",
-                    "include_bind_patterns", "include_volume_patterns"):
-            cfg[key] = _clean_patterns(data.get(key))
     except FileNotFoundError:
         write_json(SETTINGS_PATH, cfg)
     except Exception as exc:  # noqa: BLE001
@@ -215,71 +220,6 @@ def load_settings():
 
 def save_settings(cfg):
     write_json(SETTINGS_PATH, cfg)
-
-
-def _clean_patterns(value):
-    """Accept a list or newline/space string of globs; return a deduped list.
-
-    Patterns may not contain whitespace (each token is a single shell glob) and
-    are capped to keep the exec environment small.
-    """
-    if isinstance(value, str):
-        tokens = value.replace("\r", "\n").replace("\n", " ").split()
-    elif isinstance(value, list):
-        tokens = []
-        for item in value:
-            tokens.extend(str(item).split())
-    else:
-        return []
-    out = []
-    for tok in tokens:
-        tok = tok.strip()
-        if tok and tok not in out:
-            out.append(tok)
-        if len(out) >= 200:
-            break
-    return out
-
-
-# --------------------------------------------------------------------------- #
-# per-mount exclusions  (Mounts tab: keep/skip individual volumes & binds)
-# --------------------------------------------------------------------------- #
-def load_exclusions():
-    """Return {'volumes': {name: 'include'|'exclude'},
-               'binds':   {source: 'include'|'exclude'}}.
-
-    Only mounts the user explicitly overrode are stored; everything absent keeps
-    the default behaviour (back it up unless a global pattern/network rule skips).
-    """
-    data = {"volumes": {}, "binds": {}}
-    try:
-        with open(EXCLUSIONS_PATH, encoding="utf-8") as fh:
-            raw = json.load(fh)
-    except FileNotFoundError:
-        return data
-    except Exception as exc:  # noqa: BLE001
-        log(f"WARN could not read exclusions: {exc}")
-        return data
-    for kind in ("volumes", "binds"):
-        section = raw.get(kind, {})
-        if isinstance(section, dict):
-            for key, rule in section.items():
-                if isinstance(key, str) and rule in ("include", "exclude"):
-                    data[kind][key] = rule
-    return data
-
-
-def save_exclusions(data):
-    clean = {"volumes": {}, "binds": {}}
-    for kind in ("volumes", "binds"):
-        section = (data or {}).get(kind, {})
-        if isinstance(section, dict):
-            for key, rule in section.items():
-                if isinstance(key, str) and rule in ("include", "exclude"):
-                    clean[kind][key] = rule
-    write_json(EXCLUSIONS_PATH, clean)
-    return clean
-
 
 
 # --------------------------------------------------------------------------- #
@@ -296,8 +236,37 @@ def _default_schedule():
         "day_of_month": 1,                   # used when frequency == monthly
         "mode": "all",                       # all | selected | running
         "containers": [],                    # used only when mode == selected
+        "skip_network": False,               # exclude NFS/SMB/CIFS mounts this run
+        "container_mounts": {},              # per-container mount selection (mode==selected)
         "retention": DEFAULT_RETENTION,      # keep last N runs of this schedule
     }
+
+
+def _clean_container_mounts(value):
+    """Validate a {container: {all, mounts[], skip_network}} selection map."""
+    out = {}
+    if not isinstance(value, dict):
+        return out
+    for name, entry in value.items():
+        if not isinstance(name, str) or not NAME_RE.match(name):
+            continue
+        if not isinstance(entry, dict):
+            continue
+        keys = []
+        raw_keys = entry.get("mounts")
+        if isinstance(raw_keys, list):
+            for k in raw_keys:
+                k = str(k)
+                if (k.startswith("vol:") or k.startswith("bind:")) and k not in keys:
+                    keys.append(k)
+                if len(keys) >= 200:
+                    break
+        out[name] = {
+            "all": bool(entry.get("all", True)),
+            "mounts": keys,
+            "skip_network": bool(entry.get("skip_network", False)),
+        }
+    return out
 
 
 def _normalise_schedule(s, existing_ids):
@@ -335,6 +304,8 @@ def _normalise_schedule(s, existing_ids):
         # backward compat: old schedules only stored containers ([] == everything)
         mode = "selected" if out["containers"] else "all"
     out["mode"] = mode
+    out["skip_network"] = bool(s.get("skip_network", False))
+    out["container_mounts"] = _clean_container_mounts(s.get("container_mounts"))
     ret = s.get("retention")
     if isinstance(ret, int) and 1 <= ret <= 999:
         out["retention"] = ret
@@ -441,14 +412,14 @@ def _volume_is_network(name):
 
 
 def list_mounts():
-    """Enumerate every container's volumes and bind mounts for the Mounts tab.
+    """Enumerate every container's volumes and bind mounts.
 
-    Returns one entry per container with its mounts annotated by the user's
-    current keep/skip rule (from exclusions.json). Bind fstype is not probed here
-    (that needs a host helper and would be slow); the global "skip network mounts"
-    toggle handles network binds at backup time instead.
+    Returns one entry per container, each mount carrying a stable selection key
+    (``vol:<name>`` or ``bind:<destination>``) used by the per-run / per-schedule
+    mount picker. Bind fstype is not probed here (that needs a host helper and
+    would be slow); the per-container "skip network mounts" toggle handles network
+    binds at backup time instead.
     """
-    exclusions = load_exclusions()
     containers = list_containers()
     result = []
     for c in containers:
@@ -468,19 +439,38 @@ def list_mounts():
                 continue
             mtype, vname, source, dest = parts[0], parts[1], parts[2], parts[3]
             if mtype == "volume" and vname:
-                rule = exclusions["volumes"].get(vname, "default")
-                mounts.append({"kind": "volume", "key": vname, "id": vname,
+                mounts.append({"kind": "volume", "mkey": "vol:" + vname,
                                "label": vname, "dest": dest,
-                               "network": _volume_is_network(vname), "rule": rule})
+                               "network": _volume_is_network(vname)})
             elif mtype == "bind" and source:
-                rule = exclusions["binds"].get(source, "default")
-                mounts.append({"kind": "bind", "key": source, "id": source,
-                               "label": source, "dest": dest,
-                               "network": False, "rule": rule})
+                mounts.append({"kind": "bind", "mkey": "bind:" + dest,
+                               "label": source, "dest": dest, "network": False})
         if mounts:
             result.append({"container": name, "project": c["project"],
                            "mounts": mounts})
     return result
+
+
+def list_self_mounts():
+    """Return the docker-backup container's own mounts (for the root picker)."""
+    items = []
+    rc, out = run(["docker", "inspect", "-f",
+                   '{{range .Mounts}}{{.Type}}\t{{.Source}}\t{{.Destination}}\n{{end}}',
+                   SELF_NAME])
+    if rc != 0:
+        return items
+    for ln in out.splitlines():
+        if not ln.strip():
+            continue
+        parts = ln.split("\t")
+        if len(parts) < 3:
+            continue
+        mtype, source, dest = parts[0], parts[1], parts[2]
+        if dest in ("/var/run/docker.sock", "/run/docker.sock"):
+            continue
+        items.append({"type": mtype, "source": source, "dest": dest,
+                      "is_root": os.path.realpath(dest) == BACKUP_ROOT})
+    return items
 
 
 # --------------------------------------------------------------------------- #
@@ -606,52 +596,52 @@ def _backup_progress_line(line):
         STATE["step"] = f"{cur} \u00b7 volume {mv.group(1)}" if cur else f"volume {mv.group(1)}"
 
 
-def _backup_env(settings):
-    """Build the child environment for backup.sh from settings + per-mount rules.
+def _write_selection_file(names, container_mounts):
+    """Write a per-container TSV selection file for backup.sh; return its path.
 
-    Returns None when nothing is configured (so the child inherits this process'
-    environment unchanged — identical to the tool's original behaviour). Anything
-    we set goes through the EXTRA_* / SKIP_NETWORK_MOUNTS variables, which APPEND
-    to backup.sh's built-in defaults rather than replacing them.
+    One line per named container: ``<container>\t<skip_network>\t<spec>`` where
+    spec is ``*`` (all mounts) or a comma-separated list of mount keys
+    (``vol:<name>`` / ``bind:<dest>``). Returns None when there is nothing to
+    write (so backup.sh defaults every container to all mounts).
     """
-    exclusions = load_exclusions()
-    extra_excl_vol = list(settings.get("exclude_volume_patterns", []))
-    extra_excl_bind = list(settings.get("exclude_bind_patterns", []))
-    extra_incl_vol = list(settings.get("include_volume_patterns", []))
-    extra_incl_bind = list(settings.get("include_bind_patterns", []))
-    # Per-mount choices map onto the same EXTRA_* pattern lists, matching a volume
-    # by its exact name and a bind by its exact host source path.
-    for vname, rule in exclusions["volumes"].items():
-        (extra_incl_vol if rule == "include" else extra_excl_vol).append(vname)
-    for source, rule in exclusions["binds"].items():
-        (extra_incl_bind if rule == "include" else extra_excl_bind).append(source)
-
-    overrides = {}
-    if extra_excl_vol:
-        overrides["EXTRA_EXCLUDE_VOLUME_PATTERNS"] = " ".join(extra_excl_vol)
-    if extra_excl_bind:
-        overrides["EXTRA_EXCLUDE_BIND_PATTERNS"] = " ".join(extra_excl_bind)
-    if extra_incl_vol:
-        overrides["EXTRA_INCLUDE_VOLUME_PATTERNS"] = " ".join(extra_incl_vol)
-    if extra_incl_bind:
-        overrides["EXTRA_INCLUDE_BIND_PATTERNS"] = " ".join(extra_incl_bind)
-    if settings.get("skip_network_mounts"):
-        overrides["SKIP_NETWORK_MOUNTS"] = "1"
-    if not overrides:
+    if not names or not container_mounts:
         return None
-    env = dict(os.environ)
-    env.update(overrides)
-    return env
+    lines = []
+    for n in names:
+        cm = container_mounts.get(n) or {}
+        sn = "1" if cm.get("skip_network") else "0"
+        if cm.get("all", True):
+            spec = "*"
+        else:
+            keys = [str(k) for k in (cm.get("mounts") or []) if k]
+            # "__none__" is a sentinel matching no mount key, so a container can
+            # be backed up (manifest/compose) with none of its data mounts.
+            spec = ",".join(keys) if keys else "__none__"
+        lines.append(f"{n}\t{sn}\t{spec}")
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    path = os.path.join(CONFIG_DIR,
+                        f".selection-{datetime.now().strftime('%Y%m%d%H%M%S%f')}.tsv")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return path
 
 
-def do_backup(names, bucket, retention, label, running_only=False):
+def do_backup(names, bucket, retention, label, running_only=False,
+              container_mounts=None, skip_network=False):
     settings = load_settings()
     dest = settings["destination"]
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     bucket_rel = "/".join(p for p in (dest, bucket) if p)
     run_subpath = f"{bucket_rel}/{stamp}"
     extra = ["--running"] if running_only and not names else []
-    env = _backup_env(settings)
+    # Build the child environment: a global network-skip default (used for
+    # all/running scope and any container without an explicit line) plus a
+    # per-container selection file when specific containers were chosen.
+    env = dict(os.environ)
+    env["SKIP_NETWORK_MOUNTS"] = "1" if skip_network else "0"
+    sel_path = _write_selection_file(names, container_mounts)
+    if sel_path:
+        env["SELECTION_FILE"] = sel_path
     # Estimate how many containers this run will touch, for the progress bar.
     if names:
         total = len(names)
@@ -666,8 +656,15 @@ def do_backup(names, bucket, retention, label, running_only=False):
         STATE["total"] = total
         STATE["step"] = "starting\u2026"
         log(f"Backup started ({label}) -> {run_subpath}")
-        rc, out = run_stream(["/usr/local/bin/backup.sh", run_subpath, *extra, *names],
-                             _backup_progress_line, timeout=3600, env=env)
+        try:
+            rc, out = run_stream(["/usr/local/bin/backup.sh", run_subpath, *extra, *names],
+                                 _backup_progress_line, timeout=3600, env=env)
+        finally:
+            if sel_path:
+                try:
+                    os.remove(sel_path)
+                except OSError:
+                    pass
         if rc == 0 and retention:
             _prune_bucket(bucket_rel, retention)
         STATE["busy"] = False
@@ -678,14 +675,27 @@ def do_backup(names, bucket, retention, label, running_only=False):
     return rc, out
 
 
-def do_manual_backup(names):
+def do_manual_backup(mode, names, container_mounts, skip_network):
     settings = load_settings()
-    label = "all containers" if not names else ", ".join(names)
-    return do_backup(names, "_manual", settings["manual_retention"], label)
+    ret = settings["manual_retention"]
+    if mode == "running":
+        return do_backup([], "_manual", ret, "all running",
+                         running_only=True, skip_network=skip_network)
+    if mode == "selected":
+        if not names:
+            log("Backup skipped: scope 'selected' but no containers chosen")
+            STATE["last_result"] = f"backup skipped: no containers @ {now()}"
+            return 0, "no containers selected"
+        label = ", ".join(names)
+        return do_backup(names, "_manual", ret, label,
+                         container_mounts=container_mounts, skip_network=skip_network)
+    return do_backup([], "_manual", ret, "all containers", skip_network=skip_network)
 
 
 def do_scheduled_backup(sched):
     mode = sched.get("mode", "all")
+    skip_network = sched.get("skip_network", False)
+    cmounts = sched.get("container_mounts", {})
     label = f"schedule '{sched['name']}'"
     if mode == "selected":
         names = sched["containers"]
@@ -693,10 +703,13 @@ def do_scheduled_backup(sched):
             log(f"Backup skipped ({label}): mode 'selected' but no containers chosen")
             STATE["last_result"] = f"backup ({label}) skipped: no containers @ {now()}"
             return 0, "no containers selected"
-        return do_backup(names, sched["id"], sched["retention"], label)
+        return do_backup(names, sched["id"], sched["retention"], label,
+                         container_mounts=cmounts, skip_network=skip_network)
     if mode == "running":
-        return do_backup([], sched["id"], sched["retention"], label, running_only=True)
-    return do_backup([], sched["id"], sched["retention"], label)
+        return do_backup([], sched["id"], sched["retention"], label,
+                         running_only=True, skip_network=skip_network)
+    return do_backup([], sched["id"], sched["retention"], label,
+                     skip_network=skip_network)
 
 
 def _valid_run(rel):
@@ -853,8 +866,9 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/containers":
             self._json(list_containers())
         elif path == "/api/mounts":
-            self._json({"containers": list_mounts(),
-                        "exclusions": load_exclusions()})
+            self._json({"containers": list_mounts()})
+        elif path == "/api/self-mounts":
+            self._json({"mounts": list_self_mounts(), "root": BACKUP_ROOT})
         elif path == "/api/runs":
             self._json(list_runs())
         elif path == "/api/schedules":
@@ -872,9 +886,16 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/backup":
             if STATE["busy"]:
                 return self._json({"error": "busy", "current": STATE["current"]}, 409)
+            mode = str(body.get("mode", "all")).lower()
+            if mode not in ("all", "selected", "running"):
+                mode = "all"
             names = [n for n in body.get("containers", []) if NAME_RE.match(str(n))]
-            threading.Thread(target=do_manual_backup, args=(names,), daemon=True).start()
-            self._json({"ok": True, "started": names or "all containers"})
+            skip_network = bool(body.get("skip_network", False))
+            cmounts = _clean_container_mounts(body.get("container_mounts"))
+            threading.Thread(target=do_manual_backup,
+                             args=(mode, names, cmounts, skip_network),
+                             daemon=True).start()
+            self._json({"ok": True, "started": names if mode == "selected" else mode})
         elif path == "/api/restore":
             if STATE["busy"]:
                 return self._json({"error": "busy", "current": STATE["current"]}, 409)
@@ -886,6 +907,16 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=do_restore, args=(run_subpath, project, container),
                              daemon=True).start()
             self._json({"ok": True, "started": run_subpath})
+        elif path == "/api/run-schedule":
+            if STATE["busy"]:
+                return self._json({"error": "busy", "current": STATE["current"]}, 409)
+            sid = str(body.get("id", ""))
+            sched = next((s for s in load_schedules() if s.get("id") == sid), None)
+            if sched is None:
+                return self._json({"ok": False, "message": "unknown schedule (save it first)"}, 404)
+            threading.Thread(target=do_scheduled_backup, args=(sched,),
+                             daemon=True).start()
+            self._json({"ok": True, "started": sched.get("name", sid)})
         elif path == "/api/stop":
             ok, msg = stop_current()
             self._json({"ok": ok, "message": msg}, 200 if ok else 409)
@@ -901,20 +932,9 @@ class Handler(BaseHTTPRequestHandler):
             mr = body.get("manual_retention")
             if isinstance(mr, int) and 1 <= mr <= 999:
                 cfg["manual_retention"] = mr
-            if "skip_network_mounts" in body:
-                cfg["skip_network_mounts"] = bool(body.get("skip_network_mounts"))
-            for key in ("exclude_bind_patterns", "exclude_volume_patterns",
-                        "include_bind_patterns", "include_volume_patterns"):
-                if key in body:
-                    cfg[key] = _clean_patterns(body.get(key))
             save_settings(cfg)
             log(f"Settings updated: {cfg}")
             self._json({"ok": True, "settings": cfg})
-        elif path == "/api/exclusions":
-            saved = save_exclusions(body)
-            log(f"Mount exclusions updated: "
-                f"{len(saved['volumes'])} volume(s), {len(saved['binds'])} bind(s)")
-            self._json({"ok": True, "exclusions": saved})
         else:
             self._json({"error": "not found"}, 404)
 
@@ -999,6 +1019,12 @@ tr.ctnRow td{background:transparent;color:var(--muted);font-size:12px;border-bot
 .sched-head .sched-caret{color:var(--muted);user-select:none;width:14px;text-align:center}
 .chip.sm{font-size:10px;padding:1px 6px}
 .sched .fld span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.mntpanel{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:6px 0 10px;background:var(--bg)}
+.mntopt{display:flex;align-items:flex-start;gap:8px;padding:3px 2px}
+.mntopt .mlbl{font:12px/1.4 ui-monospace,Consolas,monospace;word-break:break-all}
+.mexp{color:var(--muted)}.mexp:hover{color:var(--fg)}
+.schctn{display:inline-block;vertical-align:top;margin:0 8px 6px 0}
+.schctn .mntpanel{min-width:280px}
 </style></head>
 <body>
 <header>
@@ -1014,7 +1040,6 @@ tr.ctnRow td{background:transparent;color:var(--muted);font-size:12px;border-bot
   <button data-tab="backup" class="active">Backup</button>
   <button data-tab="restore">Restore</button>
   <button data-tab="schedules">Schedules</button>
-  <button data-tab="mounts">Mounts</button>
   <button data-tab="settings">Settings</button>
   <button data-tab="logs">Logs</button>
 </nav>
@@ -1030,9 +1055,10 @@ tr.ctnRow td{background:transparent;color:var(--muted);font-size:12px;border-bot
           <button class="btn sec" id="btnBackupAll" onclick="backupAll()">Back up all containers</button>
         </div>
       </div>
+      <p class="tag" style="margin:6px 0 0">Pick containers to back up now. Expand a container to choose <b>which mounts</b> to include — everything needed for a full restore (manifest, databases, compose) is always captured regardless. Per container you can exclude its network (NFS / SMB / CIFS) mounts.</p>
       <table>
         <thead><tr><th style="width:34px"><input type="checkbox" id="selAll" onclick="toggleAll(this)"></th>
-        <th>Container</th><th>Project</th><th>Image</th><th>State</th><th></th></tr></thead>
+        <th>Container</th><th>Project</th><th>Mounts</th><th>State</th><th></th></tr></thead>
         <tbody id="ctn"></tbody>
       </table>
     </div>
@@ -1053,30 +1079,25 @@ tr.ctnRow td{background:transparent;color:var(--muted);font-size:12px;border-bot
         <div class="right row">
           <button class="btn sec sm" onclick="addSchedule()">+ Add schedule</button>
         </div></div>
-      <p class="tag" style="margin:6px 0 0">Each schedule runs on its own frequency and keeps its own number of recent runs. Save each schedule with its own Save button.</p>
+      <p class="tag" style="margin:6px 0 0">Each schedule runs on its own frequency, keeps its own number of recent runs, and (in <b>Selected</b> scope) has its own per-container mount selection. Save each schedule with its own Save button.</p>
       <div id="scheds" style="margin-top:12px"></div>
-    </div>
-  </section>
-  <!-- MOUNTS -->
-  <section id="tab-mounts" class="hidden">
-    <div class="card">
-      <div class="row"><h2 style="margin:0">Mounts per container</h2>
-        <div class="right row">
-          <button class="btn sec sm" onclick="loadMounts()">↻ Refresh</button>
-          <button class="btn" onclick="saveExclusions()">Save mount choices</button>
-          <span id="mntSaved" class="tag" style="margin-left:6px"></span>
-        </div></div>
-      <p class="tag" style="margin:6px 0 0">Choose which volumes and bind mounts to back up. <b>Default</b> follows the global pattern/network rules in Settings; <b>Keep</b> always includes a mount (overrides every exclude); <b>Skip</b> always excludes it. Database volumes are kept by default — only skip data you can rebuild (media libraries, caches, downloads).</p>
-      <div id="mounts" style="margin-top:12px">loading…</div>
     </div>
   </section>
   <!-- SETTINGS -->
   <section id="tab-settings" class="hidden">
     <div class="card">
       <h2>Storage</h2>
+      <p class="tag" style="margin:0 0 12px">The <b>backups root</b> is the host folder mounted into the docker-backup container at <code>/backups</code>. It is auto-detected from the container's own mounts below. To change it, edit the volume mapping in <code>compose.yaml</code> and rebuild — every prior run under the same root is rediscovered automatically.</p>
+      <div class="row" style="margin-bottom:8px">
+        <label>Detected mounts on <b>docker-backup</b></label>
+        <button class="right btn sec sm" onclick="loadSelfMounts()">↻ Re-read mounts</button>
+      </div>
+      <div id="selfMounts" class="tag" style="margin-bottom:12px">loading…</div>
       <div class="row" style="margin-bottom:12px">
-        <label>Backups root <span class="tag">(host folder mounted into the container)</span></label>
-        <input type="text" id="setRoot" disabled style="min-width:280px">
+        <div class="fld" style="display:flex;flex-direction:column;gap:4px">
+          <label>Backups root <span class="tag">(active mount → /backups)</span></label>
+          <input type="text" id="setRoot" disabled style="min-width:280px">
+        </div>
       </div>
       <div class="row" style="margin-bottom:12px">
         <div class="fld" style="display:flex;flex-direction:column;gap:4px">
@@ -1091,36 +1112,6 @@ tr.ctnRow td{background:transparent;color:var(--muted);font-size:12px;border-bot
       </div>
       <button class="btn" onclick="saveSettings()">Save settings</button>
       <span id="setSaved" class="tag" style="margin-left:10px"></span>
-    </div>
-    <div class="card">
-      <h2>Exclusions</h2>
-      <p class="tag" style="margin:0 0 12px">Control what gets backed up across every run. These add to the built-in defaults (which already skip media libraries, the Docker socket and system paths) — they do not replace them. Leave blank to keep current behaviour. Per-container choices live in the <b>Mounts</b> tab and take priority over these patterns.</p>
-      <label class="row" style="margin-bottom:14px;gap:8px">
-        <input type="checkbox" id="setSkipNet">
-        Skip network mounts (NFS / SMB / CIFS) <span class="tag">don't back up data that lives on another server</span>
-      </label>
-      <div class="grid2">
-        <div class="fld" style="display:flex;flex-direction:column;gap:4px">
-          <label>Extra <b>exclude</b> bind patterns <span class="tag">host paths, one glob per line</span></label>
-          <textarea id="setExclBind" rows="4" placeholder="*nas-backup*&#10;*/cache/*" style="width:100%"></textarea>
-        </div>
-        <div class="fld" style="display:flex;flex-direction:column;gap:4px">
-          <label>Extra <b>exclude</b> volume patterns <span class="tag">volume names, one glob per line</span></label>
-          <textarea id="setExclVol" rows="4" placeholder="*_cache&#10;tmp_*" style="width:100%"></textarea>
-        </div>
-        <div class="fld" style="display:flex;flex-direction:column;gap:4px">
-          <label>Force <b>keep</b> bind patterns <span class="tag">overrides every exclude</span></label>
-          <textarea id="setInclBind" rows="4" placeholder="*/important/*" style="width:100%"></textarea>
-        </div>
-        <div class="fld" style="display:flex;flex-direction:column;gap:4px">
-          <label>Force <b>keep</b> volume patterns <span class="tag">overrides every exclude</span></label>
-          <textarea id="setInclVol" rows="4" placeholder="db_*" style="width:100%"></textarea>
-        </div>
-      </div>
-      <div style="margin-top:14px">
-        <button class="btn" onclick="saveSettings()">Save settings</button>
-        <span id="setSaved2" class="tag" style="margin-left:10px"></span>
-      </div>
     </div>
   </section>
   <!-- LOGS -->
@@ -1139,7 +1130,12 @@ tr.ctnRow td{background:transparent;color:var(--muted);font-size:12px;border-bot
 <script>
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 let CT=[], SCHEDS=[], SETTINGS={}, WD=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+let MNT={};            // container name -> [ {kind,mkey,label,dest,network} ]
+let BK_EXP=new Set();  // backup tab: containers whose mount panel is expanded
+let BK_SEL=new Set();  // backup tab: containers ticked for backup
+let GRP_OPEN=new Set();// backup tab: expanded project groups
 let SCH_COLLAPSED=new Set();
+let SCH_MEXP=new Set();  // schedules: "<schedId>|<container>" with mount panel open
 let SCH_INIT=false;
 let SCH_BASELINE={};
 function schSnapshot(){SCH_BASELINE={};SCHEDS.forEach(s=>{SCH_BASELINE[s.id]=JSON.stringify(s)})}
@@ -1158,12 +1154,38 @@ $$("nav button").forEach(b=>b.onclick=()=>{
   if(cur&&cur.dataset.tab==="schedules"&&b.dataset.tab!=="schedules"&&schAnyDirty()
      &&!confirm("You have unsaved schedule changes. Leave without saving?"))return;
   $$("nav button").forEach(x=>x.classList.remove("active"));b.classList.add("active");
-  ["backup","restore","schedules","mounts","settings","logs"].forEach(t=>$("#tab-"+t).classList.toggle("hidden",t!==b.dataset.tab));
+  ["backup","restore","schedules","settings","logs"].forEach(t=>$("#tab-"+t).classList.toggle("hidden",t!==b.dataset.tab));
   if(b.dataset.tab==="logs")loadLogs();
-  if(b.dataset.tab==="mounts")loadMounts();
+  if(b.dataset.tab==="settings")loadSelfMounts();
 });
 
 /* ---------------- Backup ---------------- */
+function _q(s){return String(s).replace(/'/g,"\\'")}
+function mountSummary(name){
+  const ms=MNT[name];
+  if(ms===undefined)return '<span class=tag>…</span>';
+  if(!ms.length)return '<span class=tag>no mounts</span>';
+  const net=ms.filter(m=>m.network).length;
+  return `<span class=tag>${ms.length} mount${ms.length>1?'s':''}${net?` · ${net} net`:''}</span>`;
+}
+function bkPanel(name){
+  const ms=MNT[name];
+  const head=`<div class="row" style="margin-bottom:8px;gap:8px">
+      <span class=tag>Mounts to back up</span>
+      <button class="btn sec sm" onclick="bkAllMounts('${_q(name)}',true)">All</button>
+      <button class="btn sec sm" onclick="bkAllMounts('${_q(name)}',false)">None</button>
+      <label class="chip"><input type=checkbox class="bks" data-c="${esc(name)}"> exclude network (NFS/SMB/CIFS)</label>
+    </div>`;
+  if(ms===undefined)return `<div class="mntpanel">${head}<div class=tag>loading mounts…</div></div>`;
+  if(!ms.length)return `<div class="mntpanel">${head}<div class=tag>No volumes or bind mounts — only the container manifest/compose are captured.</div></div>`;
+  const rows=ms.map(m=>{
+    const net=m.network?' <span class="tag">network</span>':'';
+    return `<label class="mntopt"><input type=checkbox class="bkm" data-c="${esc(name)}" data-mkey="${esc(m.mkey)}" checked>
+      <span class="mlbl"><b>${esc(m.kind)}</b> ${esc(m.label)}${net}<span class="tag"> → ${esc(m.dest)}</span></span></label>`;
+  }).join("");
+  return `<div class="mntpanel">${head}${rows}</div>`;
+}
+function bkAllMounts(name,on){$$('.bkm[data-c="'+CSS.escape(name)+'"]').forEach(x=>x.checked=on)}
 function renderContainers(){
   const tb=$("#ctn");tb.innerHTML="";
   if(!CT.length){tb.innerHTML='<tr><td colspan=6 class=muted>No containers found.</td></tr>';return}
@@ -1173,49 +1195,79 @@ function renderContainers(){
     const running=list.filter(c=>c.state==="running").length;
     const label=proj==="_standalone"?"(standalone)":proj;
     const gid="g_"+proj.replace(/[^A-Za-z0-9]/g,"_");
+    const open=GRP_OPEN.has(gid);
     const gh=document.createElement("tr");gh.className="grp";
     gh.innerHTML=`<td><input type=checkbox id="${gid}_cb" data-gid="${gid}" title="Select stack" onclick="toggleGroup('${gid}',this)"></td>
-      <td colspan=4><span class=caret onclick="toggleCollapse('${gid}',this)">\u25b8</span>
+      <td colspan=4><span class=caret onclick="toggleCollapse('${gid}')">${open?'\u25be':'\u25b8'}</span>
         <b class=stackName title="Select all containers in this stack" onclick="selectStack('${gid}')">\uD83D\uDCE6 ${esc(label)}</b>
         <span class=tag>&nbsp;${list.length} container${list.length>1?"s":""} \u00b7 ${running} running</span></td>
       <td class=right><button class="btn sm" onclick="backupProject('${esc(proj)}')">Back up stack</button></td>`;
     tb.appendChild(gh);
     list.forEach(c=>{
-      const tr=document.createElement("tr");tr.className="member hidden "+gid;
-      tr.innerHTML=`<td style="padding-left:30px"><input type=checkbox class="csel ${gid}" value="${esc(c.name)}" onchange="syncStates()"></td>
+      const exp=BK_EXP.has(c.name);
+      const tr=document.createElement("tr");tr.className="member "+gid+(open?"":" hidden");
+      tr.innerHTML=`<td style="padding-left:30px"><input type=checkbox class="csel ${gid}" value="${esc(c.name)}" ${BK_SEL.has(c.name)?'checked':''} onchange="bkSel('${_q(c.name)}',this.checked)"></td>
         <td><b>${esc(c.name)}</b></td><td class=muted>${esc(c.project)}</td>
-        <td class=tag>${esc(c.image)}</td>
+        <td><span class="mexp" style="cursor:pointer" onclick="bkToggle('${_q(c.name)}')">${exp?'\u25be':'\u25b8'} ${mountSummary(c.name)}</span></td>
         <td><span class="dot ${c.state}"></span>${c.state}</td>
         <td><button class="btn sm" onclick="backupOne('${esc(c.name)}')">Back up</button></td>`;
       tb.appendChild(tr);
+      if(exp){
+        const pr=document.createElement("tr");pr.className="member mntrow "+gid+(open?"":" hidden");
+        pr.innerHTML=`<td></td><td colspan=5>${bkPanel(c.name)}</td>`;
+        tb.appendChild(pr);
+      }
     });
   });
+  syncStates();
 }
-function toggleAll(cb){$$(".csel").forEach(x=>x.checked=cb.checked);syncStates()}
-function toggleGroup(gid,cb){$$(".csel."+gid).forEach(x=>x.checked=cb.checked);syncStates()}
-function selectStack(gid){const boxes=$$(".csel."+gid);const all=boxes.length&&[...boxes].every(x=>x.checked);boxes.forEach(x=>x.checked=!all);syncStates()}
+function bkSel(name,on){if(on)BK_SEL.add(name);else BK_SEL.delete(name);syncStates()}
+function bkToggle(name){if(BK_EXP.has(name))BK_EXP.delete(name);else BK_EXP.add(name);renderContainers()}
+function toggleAll(cb){$$(".csel").forEach(x=>{x.checked=cb.checked;bkSel(x.value,cb.checked)});syncStates()}
+function toggleGroup(gid,cb){$$(".csel."+gid).forEach(x=>{x.checked=cb.checked;bkSel(x.value,cb.checked)});syncStates()}
+function selectStack(gid){const boxes=$$(".csel."+gid);const all=boxes.length&&[...boxes].every(x=>x.checked);
+  boxes.forEach(x=>{x.checked=!all;bkSel(x.value,!all)});syncStates()}
 function syncStates(){
-  // each stack checkbox reflects whether all its containers are selected
   $$("[data-gid]").forEach(cb=>{
     const boxes=$$(".csel."+cb.dataset.gid);
     cb.checked=boxes.length>0&&[...boxes].every(x=>x.checked);
   });
-  // top "select all" reflects whether every container is selected
   const all=$$(".csel"),sel=$("#selAll");
   if(sel)sel.checked=all.length>0&&[...all].every(x=>x.checked);
 }
-function toggleCollapse(gid,el){const hide=el.textContent==="\u25be";$$("tr.member."+gid).forEach(r=>r.classList.toggle("hidden",hide));el.textContent=hide?"\u25b8":"\u25be"}
-function backupProject(proj){const names=CT.filter(c=>c.project===proj).map(c=>c.name);if(!names.length)return;backup(names)}
-function selected(){return $$(".csel").filter(x=>x.checked).map(x=>x.value)}
-async function backup(names){
+function toggleCollapse(gid){if(GRP_OPEN.has(gid))GRP_OPEN.delete(gid);else GRP_OPEN.add(gid);renderContainers()}
+function backupProject(proj){const names=CT.filter(c=>c.project===proj).map(c=>c.name);if(!names.length)return;backupNames(names)}
+function selectedNames(){return $$(".csel").filter(x=>x.checked).map(x=>x.value)}
+function bkSelectionFor(names){
+  // build {container:{all,mounts,skip_network}} from the rendered panels
+  const cm={};
+  names.forEach(n=>{
+    const boxes=$$('.bkm[data-c="'+CSS.escape(n)+'"]');
+    const skip=$$('.bks[data-c="'+CSS.escape(n)+'"]').some(x=>x.checked);
+    if(!boxes.length){cm[n]={all:true,mounts:[],skip_network:skip};return}
+    const checked=boxes.filter(x=>x.checked).map(x=>x.dataset.mkey);
+    const all=checked.length===boxes.length;
+    cm[n]={all,mounts:all?[]:checked,skip_network:skip};
+  });
+  return cm;
+}
+async function backupRun(payload){
   try{await api("/api/backup",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({containers:names})});
-    toast("Backup started: "+(names.length?names.join(", "):"all containers"));setTimeout(refresh,800);
+    body:JSON.stringify(payload)});
+    toast("Backup started");setTimeout(refresh,800);
   }catch(e){toast("Error: "+e.message)}
 }
-const backupSelected=()=>{const s=selected();if(!s.length)return toast("Select at least one container");backup(s)};
-const backupAll=()=>backup([]);
-const backupOne=n=>backup([n]);
+function backupNames(names){
+  // expand panels for any selected container so its mount choices are read
+  const need=names.filter(n=>!BK_EXP.has(n));
+  if(need.length){need.forEach(n=>BK_EXP.add(n));
+    CT.forEach(c=>{if(names.includes(c.name))GRP_OPEN.add("g_"+c.project.replace(/[^A-Za-z0-9]/g,"_"))});
+    renderContainers();}
+  backupRun({mode:"selected",containers:names,container_mounts:bkSelectionFor(names)});
+}
+const backupSelected=()=>{const s=selectedNames();if(!s.length)return toast("Select at least one container");backupNames(s)};
+const backupAll=()=>{if(!confirm("Back up ALL containers with all their mounts?"))return;backupRun({mode:"all",skip_network:false})};
+const backupOne=n=>backupNames([n]);
 async function stopJob(){
   if(!confirm("Stop the current backup/restore?\nThe in-progress run is incomplete and will be discarded."))return;
   try{const r=await api("/api/stop",{method:"POST"});toast(r.message||"stopping\u2026");setTimeout(refresh,600);
@@ -1295,9 +1347,14 @@ function renderSchedules(){
     const mode=s.mode||'all';const isSel=mode==='selected';
     const groups={};CT.forEach(c=>{(groups[c.project]=groups[c.project]||[]).push(c)});
     const opts=Object.keys(groups).sort().map(proj=>{
-      const chips=groups[proj].map(c=>`<label class="chip ${(isSel&&s.containers.includes(c.name))?'on':''}">
-        <input type=checkbox ${(isSel&&s.containers.includes(c.name))?'checked':''}
-          onchange="schCtn(${idx},'${esc(c.name)}',this.checked)"> ${esc(c.name)}</label>`).join(" ");
+      const chips=groups[proj].map(c=>{
+        const on=isSel&&s.containers.includes(c.name);
+        const exp=on&&SCH_MEXP.has(s.id+"|"+c.name);
+        return `<div class="schctn">
+          <label class="chip ${on?'on':''}"><input type=checkbox ${on?'checked':''}
+            onchange="schCtn(${idx},'${_q(c.name)}',this.checked)"> ${esc(c.name)}</label>
+          ${on?`<button class="btn sec sm" style="margin-left:4px" onclick="schMExp('${esc(s.id)}','${_q(c.name)}')">${exp?'\u25be mounts':'\u25b8 mounts'}</button>`:''}
+          ${exp?schMountPanel(idx,c.name):''}</div>`;}).join(" ");
       const projNames=groups[proj].map(c=>c.name);
       const projSel=isSel&&projNames.every(n=>s.containers.includes(n));
       return `<div class="sched-proj">
@@ -1327,6 +1384,7 @@ function renderSchedules(){
         <span class="right row" onclick="event.stopPropagation()">
           ${dirty?'<span class="tag" style="color:var(--warn)">● unsaved</span>':'<span class="tag" style="color:var(--ok)">saved</span>'}
           <button class="btn sm ${dirty?'':'sec'}" onclick="saveSchedule(${idx})">Save</button>
+          <button class="btn sec sm" onclick="runSchedule(${idx})">▶ Run now</button>
           <button class="btn sec sm danger" onclick="rmSchedule(${idx})">Remove</button>
         </span>
       </div>
@@ -1349,12 +1407,42 @@ function renderSchedules(){
           <label class="chip ${mode==='all'?'on':''}"><input type=radio name="schmode_${esc(s.id)}" ${mode==='all'?'checked':''} onchange="schMode(${idx},'all')"> All</label>
           <label class="chip ${mode==='selected'?'on':''}"><input type=radio name="schmode_${esc(s.id)}" ${mode==='selected'?'checked':''} onchange="schMode(${idx},'selected')"> Selected</label>
           <label class="chip ${mode==='running'?'on':''}"><input type=radio name="schmode_${esc(s.id)}" ${mode==='running'?'checked':''} onchange="schMode(${idx},'running')"> All Running</label></div>
+        ${mode!=='selected'?`<label class="chip ${s.skip_network?'on':''}" style="margin-bottom:6px"><input type=checkbox ${s.skip_network?'checked':''} onchange="SCHEDS[${idx}].skip_network=this.checked;renderSchedules()"> exclude network mounts (NFS/SMB/CIFS)</label>`:''}
         ${isSel?`<div class="row">${opts||'<span class=muted>no containers</span>'}</div>`:''}
       </div>
       </div>`;
     el.appendChild(div);
   });
 }
+function schMountPanel(idx,name){
+  const s=SCHEDS[idx];const ms=MNT[name];
+  const cm=(s.container_mounts&&s.container_mounts[name])||{all:true,mounts:[],skip_network:false};
+  const head=`<div class="row" style="margin:6px 0;gap:8px">
+    <button class="btn sec sm" onclick="schMntAll(${idx},'${_q(name)}',true)">All</button>
+    <button class="btn sec sm" onclick="schMntAll(${idx},'${_q(name)}',false)">None</button>
+    <label class="chip"><input type=checkbox ${cm.skip_network?'checked':''} onchange="schMntNet(${idx},'${_q(name)}',this.checked)"> exclude network</label></div>`;
+  if(ms===undefined)return `<div class="mntpanel">${head}<div class=tag>loading mounts…</div></div>`;
+  if(!ms.length)return `<div class="mntpanel">${head}<div class=tag>No mounts — manifest/compose only.</div></div>`;
+  const rows=ms.map(m=>{
+    const checked=cm.all?true:cm.mounts.includes(m.mkey);
+    const net=m.network?' <span class="tag">network</span>':'';
+    return `<label class="mntopt"><input type=checkbox ${checked?'checked':''} onchange="schMnt(${idx},'${_q(name)}','${esc(m.mkey)}',this.checked)">
+      <span class="mlbl"><b>${esc(m.kind)}</b> ${esc(m.label)}${net}<span class="tag"> → ${esc(m.dest)}</span></span></label>`;
+  }).join("");
+  return `<div class="mntpanel">${head}${rows}</div>`;
+}
+function _schCM(s,name){if(!s.container_mounts)s.container_mounts={};
+  if(!s.container_mounts[name])s.container_mounts[name]={all:true,mounts:[],skip_network:false};
+  return s.container_mounts[name]}
+function schMnt(idx,name,mkey,on){const s=SCHEDS[idx];const cm=_schCM(s,name);
+  const all=(MNT[name]||[]).map(m=>m.mkey);
+  let set=new Set(cm.all?all:cm.mounts);
+  if(on)set.add(mkey);else set.delete(mkey);
+  cm.mounts=all.filter(k=>set.has(k));cm.all=cm.mounts.length===all.length;renderSchedules()}
+function schMntAll(idx,name,on){const s=SCHEDS[idx];const cm=_schCM(s,name);
+  cm.all=on;cm.mounts=[];renderSchedules()}
+function schMntNet(idx,name,on){const s=SCHEDS[idx];const cm=_schCM(s,name);cm.skip_network=on;renderSchedules()}
+function schMExp(id,name){const k=id+"|"+name;if(SCH_MEXP.has(k))SCH_MEXP.delete(k);else SCH_MEXP.add(k);renderSchedules()}
 function schToggle(id,ev){if(ev)ev.stopPropagation();
   if(SCH_COLLAPSED.has(id))SCH_COLLAPSED.delete(id);else SCH_COLLAPSED.add(id);renderSchedules()}
 function schMode(idx,mode){const s=SCHEDS[idx];s.mode=mode;renderSchedules()}
@@ -1362,10 +1450,12 @@ function schProj(idx,proj,on){const s=SCHEDS[idx];const projNames=CT.filter(c=>c
   s.mode='selected';let set=new Set(s.containers||[]);
   projNames.forEach(n=>{if(on)set.add(n);else set.delete(n)});s.containers=[...set];renderSchedules()}
 function schCtn(idx,name,on){const s=SCHEDS[idx];s.mode='selected';let set=new Set(s.containers||[]);
-  if(on)set.add(name);else set.delete(name);s.containers=[...set];renderSchedules()}
+  if(on)set.add(name);else{set.delete(name);if(s.container_mounts)delete s.container_mounts[name];SCH_MEXP.delete(s.id+"|"+name);}
+  s.containers=[...set];renderSchedules()}
 function schWd(idx,day,on){const s=SCHEDS[idx];let set=new Set(s.weekdays);if(on)set.add(day);else set.delete(day);s.weekdays=[...set].sort((a,b)=>a-b);renderSchedules()}
 function addSchedule(){SCHEDS.push({id:"sched-"+Date.now().toString(36),name:"New backup",enabled:true,
-  frequency:"daily",time:"03:00",weekdays:[0,1,2,3,4,5,6],day_of_month:1,mode:"all",containers:[],retention:7});renderSchedules()}
+  frequency:"daily",time:"03:00",weekdays:[0,1,2,3,4,5,6],day_of_month:1,mode:"all",containers:[],
+  skip_network:false,container_mounts:{},retention:7});renderSchedules()}
 function rmSchedule(idx){
   if(schDirty(SCHEDS[idx])&&!confirm("This schedule has unsaved changes. Remove it anyway?"))return;
   SCHEDS.splice(idx,1);renderSchedules()}
@@ -1375,83 +1465,56 @@ async function saveSchedule(idx){
     toast("Schedule saved ✔");
   }catch(e){toast("Error: "+e.message)}
 }
+async function runSchedule(idx){
+  const s=SCHEDS[idx];
+  if(schDirty(s)){
+    if(!confirm("Save changes and run this schedule now?"))return;
+    try{const r=await api("/api/schedules",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({schedules:SCHEDS})});SCHEDS=r.schedules;schSnapshot();renderSchedules();
+    }catch(e){toast("Error saving: "+e.message);return}
+  }
+  try{const r=await api("/api/run-schedule",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({id:s.id})});
+    toast("Running schedule: "+(r.started||s.name));refresh();
+  }catch(e){toast("Error: "+(e.message||"could not start"))}
+}
 
 /* ---------------- Settings ---------------- */
 function renderSettings(){
-  $("#setRoot").value=SETTINGS.root||"";
+  $("#setRoot").value=SETTINGS.rootHost||SETTINGS.root||"";
   $("#setDest").value=SETTINGS.destination||"";
   $("#setManualRet").value=SETTINGS.manual_retention||10;
-  $("#setSkipNet").checked=!!SETTINGS.skip_network_mounts;
-  $("#setExclBind").value=(SETTINGS.exclude_bind_patterns||[]).join("\n");
-  $("#setExclVol").value=(SETTINGS.exclude_volume_patterns||[]).join("\n");
-  $("#setInclBind").value=(SETTINGS.include_bind_patterns||[]).join("\n");
-  $("#setInclVol").value=(SETTINGS.include_volume_patterns||[]).join("\n");
 }
-function _lines(id){return $(id).value.split(/[\r\n]+/).map(s=>s.trim()).filter(Boolean)}
+async function loadSelfMounts(){
+  const box=$("#selfMounts");
+  try{const r=await api("/api/self-mounts");
+    SETTINGS.root=r.root;
+    const ms=r.mounts||[];
+    const root=ms.find(m=>m.is_root);
+    SETTINGS.rootHost=root?root.source:r.root;
+    $("#setRoot").value=SETTINGS.rootHost||"";
+    if(!ms.length){box.innerHTML='<span class=muted>none detected</span>';return}
+    box.innerHTML=ms.map(m=>`<div class="row" style="gap:8px;margin:2px 0">
+      <button class="btn ${m.is_root?'':'sec'} sm" onclick="pickRoot('${_q(m.source)}')">${m.is_root?'\u25cf root':'use'}</button>
+      <span class="mlbl">${esc(m.dest)} <span class=tag>\u2190 ${esc(m.source)}</span></span></div>`).join("");
+  }catch(e){box.innerHTML='<span class=muted>error reading mounts</span>'}
+}
+function pickRoot(src){$("#setRoot").value=src;
+  toast("The backups root is fixed by the compose mount \u2192 /backups. Host path: "+src)}
 async function saveSettings(){
-  const body={
-    destination:$("#setDest").value,
-    manual_retention:parseInt($("#setManualRet").value)||10,
-    skip_network_mounts:$("#setSkipNet").checked,
-    exclude_bind_patterns:_lines("#setExclBind"),
-    exclude_volume_patterns:_lines("#setExclVol"),
-    include_bind_patterns:_lines("#setInclBind"),
-    include_volume_patterns:_lines("#setInclVol"),
-  };
+  const body={destination:$("#setDest").value,manual_retention:parseInt($("#setManualRet").value)||10};
   try{const r=await api("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify(body)});SETTINGS=Object.assign(SETTINGS,r.settings);renderSettings();
-    ["#setSaved","#setSaved2"].forEach(id=>{$(id).textContent="saved ✔";setTimeout(()=>$(id).textContent="",2500)});
+    $("#setSaved").textContent="saved \u2714";setTimeout(()=>$("#setSaved").textContent="",2500);
   }catch(e){toast("Error: "+e.message)}
 }
 
-/* ---------------- Mounts ---------------- */
-let MOUNTS=[], MNT_RULES={volumes:{},binds:{}};
-async function loadMounts(){
-  $("#mounts").textContent="loading…";
-  try{const r=await api("/api/mounts");
-    MOUNTS=r.containers||[];
-    MNT_RULES={volumes:Object.assign({},(r.exclusions||{}).volumes),
-               binds:Object.assign({},(r.exclusions||{}).binds)};
-    renderMounts();
-  }catch(e){$("#mounts").textContent="";toast("Error: "+e.message)}
-}
-function _mntRule(m){
-  const store=m.kind==="volume"?MNT_RULES.volumes:MNT_RULES.binds;
-  return store[m.key]||"default";
-}
-function setMntRule(kind,key,rule){
-  const store=kind==="volume"?MNT_RULES.volumes:MNT_RULES.binds;
-  if(rule==="default")delete store[key];else store[key]=rule;
-  renderMounts();
-}
-function renderMounts(){
-  const box=$("#mounts");
-  if(!MOUNTS.length){box.innerHTML='<p class="tag">No volumes or bind mounts found.</p>';return}
-  box.innerHTML=MOUNTS.map(c=>{
-    const rows=c.mounts.map(m=>{
-      const rule=_mntRule(m);
-      const net=m.network?' <span class="tag">network</span>':"";
-      const kindLbl=m.kind==="volume"?"volume":"bind";
-      const seg=["default","include","exclude"].map(r=>{
-        const on=rule===r?" on"+(r==="include"?" keep":r==="exclude"?" skip":""):"";
-        const lbl=r==="default"?"Default":r==="include"?"Keep":"Skip";
-        return `<button class="${on.trim()}" onclick="setMntRule('${m.kind}','${esc(m.key).replace(/'/g,"\\'")}','${r}')">${lbl}</button>`;
-      }).join("");
-      return `<tr><td class="tag" style="width:54px">${kindLbl}</td>`+
-             `<td class="path">${esc(m.label)}${net}<div class="tag">→ ${esc(m.dest)}</div></td>`+
-             `<td style="width:210px;text-align:right"><span class="seg">${seg}</span></td></tr>`;
-    }).join("");
-    return `<div class="mnt"><h3>${esc(c.container)} <span class="tag">${esc(c.project)}</span></h3>`+
-           `<table>${rows}</table></div>`;
-  }).join("");
-}
-async function saveExclusions(){
-  try{const r=await api("/api/exclusions",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify(MNT_RULES)});
-    MNT_RULES={volumes:Object.assign({},r.exclusions.volumes),binds:Object.assign({},r.exclusions.binds)};
-    renderMounts();
-    $("#mntSaved").textContent="saved ✔";setTimeout(()=>$("#mntSaved").textContent="",2500);
-  }catch(e){toast("Error: "+e.message)}
+/* ---------------- Mounts data ---------------- */
+async function loadAllMounts(){
+  try{const r=await api("/api/mounts");const m={};
+    (r.containers||[]).forEach(c=>{m[c.container]=c.mounts||[]});
+    MNT=m;renderContainers();renderSchedules();
+  }catch(e){}
 }
 
 /* ---------------- common ---------------- */
@@ -1482,9 +1545,10 @@ async function refresh(){
     CT=s.containers;SCHEDS=s.schedules;WD=s.weekdayNames||WD;
     if(!SCH_INIT){SCHEDS.forEach(x=>SCH_COLLAPSED.add(x.id));SCH_INIT=true;}
     schSnapshot();
-    SETTINGS=Object.assign({},s.settings,{root:s.root});
+    SETTINGS=Object.assign({},s.settings,{root:s.root,rootHost:SETTINGS.rootHost});
     $("#rootTag").textContent="root: "+s.root;
     renderContainers();renderRuns(s.runs);renderSchedules();renderSettings();setStatus(s);
+    loadAllMounts();
   }catch(e){toast("Error: "+e.message)}
 }
 async function loadLogs(){

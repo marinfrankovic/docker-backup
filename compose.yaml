@@ -18,10 +18,10 @@ services:
       HELPER_IMAGE: ${HELPER_IMAGE:-alpine:3.20}
       SELF_NAME: docker-backup
       GUI_PORT: ${GUI_PORT:-8088}
-      # Optional exclusion globs; unset = built-in defaults (skip media libraries
-      # for volumes, plus Docker socket/host system files for bind mounts).
-      EXCLUDE_VOLUME_PATTERNS: ${EXCLUDE_VOLUME_PATTERNS:-}
-      EXCLUDE_BIND_PATTERNS: ${EXCLUDE_BIND_PATTERNS:-}
+      # What gets backed up is chosen per run / per schedule in the GUI (every
+      # container's mounts are listed; pick all or specific ones, and optionally
+      # exclude NFS/SMB/CIFS mounts). Only the Docker socket and host system
+      # files are always skipped. No global exclusion patterns are needed.
     ports:
       - "127.0.0.1:${GUI_PORT:-8088}:${GUI_PORT:-8088}"   # web GUI, bound to localhost only
     volumes:

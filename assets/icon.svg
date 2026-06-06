@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="Docker Backup">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1d8bf1"/>
+      <stop offset="1" stop-color="#0b63c4"/>
+    </linearGradient>
+    <linearGradient id="box" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#dbeafe"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#062a52" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <!-- Rounded app background -->
+  <rect x="0" y="0" width="512" height="512" rx="112" fill="url(#bg)"/>
+
+  <!-- Subtle container deck lines (top) -->
+  <g opacity="0.18" fill="#ffffff">
+    <rect x="120" y="96" width="60" height="22" rx="6"/>
+    <rect x="196" y="96" width="120" height="22" rx="6"/>
+    <rect x="332" y="96" width="60" height="22" rx="6"/>
+  </g>
+
+  <!-- Stacked container (backup box) -->
+  <g filter="url(#shadow)">
+    <rect x="146" y="168" width="220" height="176" rx="22" fill="url(#box)"/>
+    <!-- lid seam -->
+    <rect x="146" y="214" width="220" height="10" fill="#bcd6f5" opacity="0.9"/>
+    <!-- slats -->
+    <g fill="#1d8bf1" opacity="0.85">
+      <rect x="176" y="246" width="14" height="74" rx="7"/>
+      <rect x="212" y="246" width="14" height="74" rx="7"/>
+      <rect x="248" y="246" width="14" height="74" rx="7"/>
+      <rect x="284" y="246" width="14" height="74" rx="7"/>
+      <rect x="320" y="246" width="14" height="74" rx="7"/>
+    </g>
+  </g>
+
+  <!-- Circular restore arrow wrapping the box -->
+  <g fill="none" stroke="#ffffff" stroke-width="22" stroke-linecap="round">
+    <path d="M 356 256
+             A 100 100 0 1 1 256 156"/>
+  </g>
+  <!-- Arrow head -->
+  <path d="M 256 116 L 256 196 L 312 156 Z" fill="#ffffff"/>
+</svg>

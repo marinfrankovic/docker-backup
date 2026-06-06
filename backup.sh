@@ -30,94 +30,67 @@ HELPER_IMAGE="${HELPER_IMAGE:-alpine:3.20}"
 SELF_NAME="${SELF_NAME:-docker-backup}"
 HELPER_LABEL="docker-backup-helper=1"
 
-# Mount-exclusion model
-# ----------------------
-# A mount (named volume or bind) is SKIPPED when it matches an EXCLUDE pattern or
-# (optionally) lives on a network filesystem, UNLESS it also matches an INCLUDE
-# pattern. Resolution order, highest priority first:
-#   1. INCLUDE_*_PATTERNS  -> always keep (overrides everything below)
-#   2. EXCLUDE_*_PATTERNS  -> skip
-#   3. SKIP_NETWORK_MOUNTS -> skip NFS/SMB/CIFS mounts
-#   4. (default)           -> keep
-# Patterns are space-separated shell globs matched (busybox `case`) against the
-# value. For binds, both the host SOURCE and the in-container DESTINATION are
-# tested. All lists are overridable via environment variables; the GUI passes
-# user-configured lists through these same variables.
-#
-# Volumes whose names match any EXCLUDE_VOLUME_PATTERNS glob are NEVER archived.
-# The defaults target large media-library content volumes (movies / TV / music /
-# downloads) that should be backed up separately, not bundled into app backups.
-# Set EXCLUDE_VOLUME_PATTERNS="" to disable, or pass a custom list.
-EXCLUDE_VOLUME_PATTERNS="${EXCLUDE_VOLUME_PATTERNS-*movies* *movie* *tv* *shows* *series* *media* *music* *anime* *downloads* *torrents* remote_*}"
+# Always-skip binds
+# -----------------
+# These host paths are NEVER archived: the Docker socket and kernel/pseudo or
+# host system files that are meaningless (or harmful) to restore. They are not
+# user-selectable. Everything else a container mounts is backed up unless the
+# per-run mount selection (SELECTION_FILE, below) deselects it.
+SYSTEM_BIND_PATTERNS="*/docker.sock /run/docker.sock /var/run/docker.sock /proc /proc/* /sys /sys/* /dev /dev/* /etc/localtime /etc/timezone /etc/hostname /etc/hosts /etc/resolv.conf"
 
-# Bind mounts (host paths mounted into a container, e.g. ./conf:/opt/app/conf)
-# are archived too, so containers can be fully restored. The default list skips
-# the Docker socket and pseudo/host system files (never useful to restore) plus
-# the same large media-library name fragments as above. A pattern is matched
-# against BOTH the host source path and the in-container destination path.
-# Set EXCLUDE_BIND_PATTERNS="" to disable, or pass a custom list.
-EXCLUDE_BIND_PATTERNS="${EXCLUDE_BIND_PATTERNS-*/docker.sock /run/docker.sock /var/run/docker.sock /proc /proc/* /sys /sys/* /dev /dev/* /etc/localtime /etc/timezone /etc/hostname /etc/hosts /etc/resolv.conf *movies* *movie* *tv* *shows* *series* *media* *music* *anime* *downloads* *torrents*}"
+# Per-run / per-container mount selection
+# ---------------------------------------
+# SELECTION_FILE (optional) is a TSV written by the GUI, one line per container
+# that has an explicit choice:
+#     <container><TAB><skip_network 0|1><TAB><spec>
+# where <spec> is "*" (back up every mount) or a comma-separated list of mount
+# keys: "vol:<volume-name>" for a named volume, "bind:<destination-path>" for a
+# bind mount. A container with no line defaults to spec "*" and the global
+# SKIP_NETWORK_MOUNTS setting, so anything unconfigured is fully backed up and
+# always restorable.
+SELECTION_FILE="${SELECTION_FILE:-}"
 
-# Force-keep lists: any volume/bind matching these is archived even if it also
-# matches an exclude pattern or sits on a network share. Empty by default.
-INCLUDE_VOLUME_PATTERNS="${INCLUDE_VOLUME_PATTERNS-}"
-INCLUDE_BIND_PATTERNS="${INCLUDE_BIND_PATTERNS-}"
-
-# When 1, mounts backed by a network filesystem (NFS / SMB / CIFS) are skipped
-# unless force-kept by an INCLUDE pattern. Off by default to preserve behaviour.
+# When 1, mounts on a network filesystem (NFS / SMB / CIFS) are skipped unless a
+# per-container selection line overrides it. Off by default. The GUI sets this
+# per run (globally for all/running scope, per container for selected scope).
 SKIP_NETWORK_MOUNTS="${SKIP_NETWORK_MOUNTS:-0}"
-
-# EXTRA_* lists are APPENDED to the lists above (they never replace the built-in
-# defaults). The GUI feeds user-configured patterns and per-mount choices through
-# these, so unchecking a mount in the UI adds to the excludes without wiping the
-# media-library defaults. Compose/env power users can still REPLACE a whole list
-# via the matching EXCLUDE_*/INCLUDE_* variable.
-EXCLUDE_VOLUME_PATTERNS="$EXCLUDE_VOLUME_PATTERNS ${EXTRA_EXCLUDE_VOLUME_PATTERNS:-}"
-EXCLUDE_BIND_PATTERNS="$EXCLUDE_BIND_PATTERNS ${EXTRA_EXCLUDE_BIND_PATTERNS:-}"
-INCLUDE_VOLUME_PATTERNS="$INCLUDE_VOLUME_PATTERNS ${EXTRA_INCLUDE_VOLUME_PATTERNS:-}"
-INCLUDE_BIND_PATTERNS="$INCLUDE_BIND_PATTERNS ${EXTRA_INCLUDE_BIND_PATTERNS:-}"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
-is_included_volume() { # <volume-name> -> 0 if force-kept
-  _v="$1"
-  for _pat in $INCLUDE_VOLUME_PATTERNS; do
-    case "$_v" in $_pat) return 0 ;; esac
-  done
+# Per-container selection state, (re)set by _sel_lookup before each container.
+SEL_SPEC='*'
+CUR_SKIPNET="$SKIP_NETWORK_MOUNTS"
+
+_sel_lookup() { # <container>: load SEL_SPEC + CUR_SKIPNET from SELECTION_FILE
+  SEL_SPEC='*'
+  CUR_SKIPNET="$SKIP_NETWORK_MOUNTS"
+  [ -n "$SELECTION_FILE" ] && [ -f "$SELECTION_FILE" ] || return 0
+  while IFS="$(printf '\t')" read -r _c _sn _spec; do
+    [ "$_c" = "$1" ] || continue
+    [ -n "$_sn" ] && CUR_SKIPNET="$_sn"
+    [ -n "$_spec" ] && SEL_SPEC="$_spec"
+    return 0
+  done < "$SELECTION_FILE"
+  return 0
+}
+
+_spec_has() { # <mount-key>: 0 if the current SEL_SPEC selects this mount
+  [ "$SEL_SPEC" = "*" ] && return 0
+  case ",$SEL_SPEC," in *",$1,"*) return 0 ;; esac
   return 1
 }
 
-is_excluded_volume() { # <volume-name> -> 0 if it should be skipped
-  _v="$1"
-  is_included_volume "$_v" && return 1   # explicit include overrides excludes
-  for _pat in $EXCLUDE_VOLUME_PATTERNS; do
-    case "$_v" in
-      $_pat) return 0 ;;
-    esac
-  done
-  return 1
-}
-
-is_included_bind() { # <source> <destination> -> 0 if force-kept
+is_system_bind() { # <source> <destination> -> 0 if a never-restore system path
   _s="$1"; _d="$2"
-  for _pat in $INCLUDE_BIND_PATTERNS; do
+  for _pat in $SYSTEM_BIND_PATTERNS; do
     case "$_s" in $_pat) return 0 ;; esac
     case "$_d" in $_pat) return 0 ;; esac
   done
   return 1
 }
 
-is_excluded_bind() { # <source> <destination> -> 0 if it should be skipped
-  _s="$1"; _d="$2"
-  is_included_bind "$_s" "$_d" && return 1   # explicit include overrides excludes
-  for _pat in $EXCLUDE_BIND_PATTERNS; do
-    case "$_s" in $_pat) return 0 ;; esac
-    case "$_d" in $_pat) return 0 ;; esac
-  done
-  return 1
-}
-
-# Network-filesystem detection (only consulted when SKIP_NETWORK_MOUNTS=1).
+# Network-filesystem detection (only consulted when the current container's
+# skip-network flag is on).
 _is_network_fstype() { # <fstype> -> 0 if NFS/SMB/CIFS
   case "$1" in
     nfs|nfs4|cifs|smb|smb2|smb3|smbfs|fuse.smbnetfs) return 0 ;;
@@ -126,13 +99,13 @@ _is_network_fstype() { # <fstype> -> 0 if NFS/SMB/CIFS
 }
 
 is_network_volume() { # <volume-name> -> 0 if backed by a network filesystem
-  [ "$SKIP_NETWORK_MOUNTS" = "1" ] || return 1
+  [ "$CUR_SKIPNET" = "1" ] || return 1
   _t="$(docker volume inspect -f '{{ index .Options "type" }}' "$1" 2>/dev/null)"
   _is_network_fstype "$_t"
 }
 
 is_network_bind() { # <source-dir> <basename> -> 0 if path is on a network fs
-  [ "$SKIP_NETWORK_MOUNTS" = "1" ] || return 1
+  [ "$CUR_SKIPNET" = "1" ] || return 1
   # Probe fstype from inside a throwaway helper that mounts the source dir; this
   # needs no host access and works regardless of the container's own filesystem.
   _t="$(docker run --rm --label "$HELPER_LABEL" \
@@ -213,8 +186,8 @@ archive_volumes() { # <cid> <cdest> <chost>
   docker inspect -f '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{println}}{{end}}{{end}}' "$cid" \
   | while read -r vol; do
       [ -z "$vol" ] && continue
-      if is_excluded_volume "$vol"; then
-        log "    skip volume $vol (excluded media library)"
+      if ! _spec_has "vol:$vol"; then
+        log "    skip volume $vol (deselected)"
         continue
       fi
       if is_network_volume "$vol"; then
@@ -242,8 +215,12 @@ archive_binds() { # <cid> <cdest> <chost>
       case "$src" in
         "$BACKUP_ROOT_HOST"|"$BACKUP_ROOT_HOST"/*) log "    skip bind $src (inside backups root)"; continue ;;
       esac
-      if is_excluded_bind "$src" "$dst"; then
-        log "    skip bind $src (excluded)"
+      if is_system_bind "$src" "$dst"; then
+        log "    skip bind $src (system path)"
+        continue
+      fi
+      if ! _spec_has "bind:$dst"; then
+        log "    skip bind $src (deselected)"
         continue
       fi
       sbase="$(basename "$src")"
@@ -312,6 +289,7 @@ backup_one() { # <cid>
   name="$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null | sed 's#^/##')"
   [ -z "$name" ] && { log "  WARN unknown container '$cid'"; return 0; }
   [ "$name" = "$SELF_NAME" ] && { log "  skip self ($name)"; return 0; }
+  _sel_lookup "$name"
   project="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$cid" 2>/dev/null)"
   [ -z "$project" ] && project="_standalone"
   image="$(docker inspect -f '{{.Config.Image}}' "$cid")"
