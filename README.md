@@ -217,8 +217,13 @@ schedule's **Save** button.
   what's running). Each also keeps the last N runs and has its own **Save** button.
 - **Restore** — every backup found on disk, grouped by date. Open one to restore a
   single project or the whole run. New backups show up automatically.
-- **Settings** — the backup folder, an optional subfolder for new runs, and how
-  many manual backups to keep.
+- **Mounts** — see every container's volumes and bind mounts and choose, per
+  mount, whether to **Keep** (always back up), **Skip** (never back up), or leave
+  on **Default** (follow the global rules). Handy for skipping one big cache or
+  media folder without touching anything else.
+- **Settings** — the backup folder, an optional subfolder for new runs, how many
+  manual backups to keep, a **Skip network mounts (NFS/SMB/CIFS)** toggle, and
+  extra include/exclude pattern lists that apply to every run.
 - **Logs** — live activity log.
 
 While a backup or restore is running, the header shows a **live progress bar**
@@ -277,6 +282,58 @@ EXCLUDE_BIND_PATTERNS="…defaults… */adguardhome/work"
 ```
 
 Set it to an empty string to back up every bind mount.
+
+### Choosing what to skip from the web page
+
+You don't have to edit environment variables — everything above is also
+configurable from the GUI, and your choices apply to **every** backup (manual and
+scheduled):
+
+- **Mounts tab** — lists each container's volumes and bind mounts. Set any one to
+  **Keep**, **Skip**, or **Default**. This is the easiest way to drop a single
+  cache/media folder while keeping its database volume.
+- **Settings tab → Exclusions** — a **Skip network mounts (NFS/SMB/CIFS)** toggle
+  plus four pattern boxes (one glob per line): extra **exclude** patterns for
+  binds and volumes, and force-**keep** patterns for binds and volumes.
+
+These GUI choices are **added on top of** the built-in defaults — they never wipe
+the media-library defaults — so you only ever specify what's different for your
+setup. Under the hood they are passed to the backup script through the
+`EXTRA_EXCLUDE_*` / `EXTRA_INCLUDE_*` and `SKIP_NETWORK_MOUNTS` variables.
+
+### How the rules combine (precedence)
+
+For every volume and bind mount, the decision is made in this order:
+
+1. **Force-keep wins.** If it matches an include pattern (`INCLUDE_*_PATTERNS` /
+   `EXTRA_INCLUDE_*` / a **Keep** choice in the Mounts tab), it is **always**
+   backed up — even if it also matches an exclude or sits on a network share.
+2. **Exclude.** Otherwise, if it matches an exclude pattern (`EXCLUDE_*_PATTERNS`
+   / `EXTRA_EXCLUDE_*` / a **Skip** choice), it is skipped.
+3. **Network filesystem.** Otherwise, if `SKIP_NETWORK_MOUNTS=1` and the mount
+   lives on NFS/SMB/CIFS, it is skipped (so you don't pull gigabytes off another
+   server). Volume type is read from `docker volume inspect`; bind type is probed
+   with `stat -f`.
+4. **Default: keep.** Anything not skipped above is backed up.
+
+### Environment variables (for Compose / power users)
+
+| Variable | Effect |
+| --- | --- |
+| `EXCLUDE_VOLUME_PATTERNS` | **Replaces** the default volume-exclude list. |
+| `EXCLUDE_BIND_PATTERNS` | **Replaces** the default bind-exclude list. |
+| `INCLUDE_VOLUME_PATTERNS` | Force-keep volume globs (empty by default). |
+| `INCLUDE_BIND_PATTERNS` | Force-keep bind globs (empty by default). |
+| `EXTRA_EXCLUDE_VOLUME_PATTERNS` | **Appends** to the volume-exclude list (GUI uses this). |
+| `EXTRA_EXCLUDE_BIND_PATTERNS` | **Appends** to the bind-exclude list (GUI uses this). |
+| `EXTRA_INCLUDE_VOLUME_PATTERNS` | **Appends** force-keep volume globs (GUI uses this). |
+| `EXTRA_INCLUDE_BIND_PATTERNS` | **Appends** force-keep bind globs (GUI uses this). |
+| `SKIP_NETWORK_MOUNTS` | `1` to skip NFS/SMB/CIFS mounts (off by default). |
+
+> **Backward compatible:** with no GUI choices, blank Settings, and
+> `SKIP_NETWORK_MOUNTS` unset, behaviour is identical to before — only the
+> built-in media defaults are skipped. Any existing `EXCLUDE_*` overrides keep
+> working exactly as they did.
 
 Databases are saved two ways — as a database dump **and** inside the volume copy
 — so you have two ways to recover. Stopped containers skip the live database dump,

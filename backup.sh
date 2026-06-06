@@ -30,24 +30,66 @@ HELPER_IMAGE="${HELPER_IMAGE:-alpine:3.20}"
 SELF_NAME="${SELF_NAME:-docker-backup}"
 HELPER_LABEL="docker-backup-helper=1"
 
-# Volumes whose names match any of these space-separated glob patterns are NEVER
-# archived. These are large media-library content volumes (movies / TV / music /
-# downloads) that must be backed up separately, not bundled into app backups.
-# Override with EXCLUDE_VOLUME_PATTERNS="" to disable, or a custom list.
+# Mount-exclusion model
+# ----------------------
+# A mount (named volume or bind) is SKIPPED when it matches an EXCLUDE pattern or
+# (optionally) lives on a network filesystem, UNLESS it also matches an INCLUDE
+# pattern. Resolution order, highest priority first:
+#   1. INCLUDE_*_PATTERNS  -> always keep (overrides everything below)
+#   2. EXCLUDE_*_PATTERNS  -> skip
+#   3. SKIP_NETWORK_MOUNTS -> skip NFS/SMB/CIFS mounts
+#   4. (default)           -> keep
+# Patterns are space-separated shell globs matched (busybox `case`) against the
+# value. For binds, both the host SOURCE and the in-container DESTINATION are
+# tested. All lists are overridable via environment variables; the GUI passes
+# user-configured lists through these same variables.
+#
+# Volumes whose names match any EXCLUDE_VOLUME_PATTERNS glob are NEVER archived.
+# The defaults target large media-library content volumes (movies / TV / music /
+# downloads) that should be backed up separately, not bundled into app backups.
+# Set EXCLUDE_VOLUME_PATTERNS="" to disable, or pass a custom list.
 EXCLUDE_VOLUME_PATTERNS="${EXCLUDE_VOLUME_PATTERNS-*movies* *movie* *tv* *shows* *series* *media* *music* *anime* *downloads* *torrents* remote_*}"
 
 # Bind mounts (host paths mounted into a container, e.g. ./conf:/opt/app/conf)
 # are archived too, so containers can be fully restored. The default list skips
 # the Docker socket and pseudo/host system files (never useful to restore) plus
-# the same large media-library paths as above. A pattern is matched against BOTH
-# the host source path and the in-container destination path.
-# Override with EXCLUDE_BIND_PATTERNS="" to disable, or a custom list.
+# the same large media-library name fragments as above. A pattern is matched
+# against BOTH the host source path and the in-container destination path.
+# Set EXCLUDE_BIND_PATTERNS="" to disable, or pass a custom list.
 EXCLUDE_BIND_PATTERNS="${EXCLUDE_BIND_PATTERNS-*/docker.sock /run/docker.sock /var/run/docker.sock /proc /proc/* /sys /sys/* /dev /dev/* /etc/localtime /etc/timezone /etc/hostname /etc/hosts /etc/resolv.conf *movies* *movie* *tv* *shows* *series* *media* *music* *anime* *downloads* *torrents*}"
+
+# Force-keep lists: any volume/bind matching these is archived even if it also
+# matches an exclude pattern or sits on a network share. Empty by default.
+INCLUDE_VOLUME_PATTERNS="${INCLUDE_VOLUME_PATTERNS-}"
+INCLUDE_BIND_PATTERNS="${INCLUDE_BIND_PATTERNS-}"
+
+# When 1, mounts backed by a network filesystem (NFS / SMB / CIFS) are skipped
+# unless force-kept by an INCLUDE pattern. Off by default to preserve behaviour.
+SKIP_NETWORK_MOUNTS="${SKIP_NETWORK_MOUNTS:-0}"
+
+# EXTRA_* lists are APPENDED to the lists above (they never replace the built-in
+# defaults). The GUI feeds user-configured patterns and per-mount choices through
+# these, so unchecking a mount in the UI adds to the excludes without wiping the
+# media-library defaults. Compose/env power users can still REPLACE a whole list
+# via the matching EXCLUDE_*/INCLUDE_* variable.
+EXCLUDE_VOLUME_PATTERNS="$EXCLUDE_VOLUME_PATTERNS ${EXTRA_EXCLUDE_VOLUME_PATTERNS:-}"
+EXCLUDE_BIND_PATTERNS="$EXCLUDE_BIND_PATTERNS ${EXTRA_EXCLUDE_BIND_PATTERNS:-}"
+INCLUDE_VOLUME_PATTERNS="$INCLUDE_VOLUME_PATTERNS ${EXTRA_INCLUDE_VOLUME_PATTERNS:-}"
+INCLUDE_BIND_PATTERNS="$INCLUDE_BIND_PATTERNS ${EXTRA_INCLUDE_BIND_PATTERNS:-}"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
+is_included_volume() { # <volume-name> -> 0 if force-kept
+  _v="$1"
+  for _pat in $INCLUDE_VOLUME_PATTERNS; do
+    case "$_v" in $_pat) return 0 ;; esac
+  done
+  return 1
+}
+
 is_excluded_volume() { # <volume-name> -> 0 if it should be skipped
   _v="$1"
+  is_included_volume "$_v" && return 1   # explicit include overrides excludes
   for _pat in $EXCLUDE_VOLUME_PATTERNS; do
     case "$_v" in
       $_pat) return 0 ;;
@@ -56,13 +98,47 @@ is_excluded_volume() { # <volume-name> -> 0 if it should be skipped
   return 1
 }
 
+is_included_bind() { # <source> <destination> -> 0 if force-kept
+  _s="$1"; _d="$2"
+  for _pat in $INCLUDE_BIND_PATTERNS; do
+    case "$_s" in $_pat) return 0 ;; esac
+    case "$_d" in $_pat) return 0 ;; esac
+  done
+  return 1
+}
+
 is_excluded_bind() { # <source> <destination> -> 0 if it should be skipped
   _s="$1"; _d="$2"
+  is_included_bind "$_s" "$_d" && return 1   # explicit include overrides excludes
   for _pat in $EXCLUDE_BIND_PATTERNS; do
     case "$_s" in $_pat) return 0 ;; esac
     case "$_d" in $_pat) return 0 ;; esac
   done
   return 1
+}
+
+# Network-filesystem detection (only consulted when SKIP_NETWORK_MOUNTS=1).
+_is_network_fstype() { # <fstype> -> 0 if NFS/SMB/CIFS
+  case "$1" in
+    nfs|nfs4|cifs|smb|smb2|smb3|smbfs|fuse.smbnetfs) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_network_volume() { # <volume-name> -> 0 if backed by a network filesystem
+  [ "$SKIP_NETWORK_MOUNTS" = "1" ] || return 1
+  _t="$(docker volume inspect -f '{{ index .Options "type" }}' "$1" 2>/dev/null)"
+  _is_network_fstype "$_t"
+}
+
+is_network_bind() { # <source-dir> <basename> -> 0 if path is on a network fs
+  [ "$SKIP_NETWORK_MOUNTS" = "1" ] || return 1
+  # Probe fstype from inside a throwaway helper that mounts the source dir; this
+  # needs no host access and works regardless of the container's own filesystem.
+  _t="$(docker run --rm --label "$HELPER_LABEL" \
+          -v "$1":/probe:ro "$HELPER_IMAGE" \
+          stat -f -c %T "/probe/$2" 2>/dev/null)"
+  _is_network_fstype "$_t"
 }
 
 [ "$#" -ge 1 ] || { echo "usage: backup.sh <run_subpath> [--running | container...]" >&2; exit 2; }
@@ -141,6 +217,10 @@ archive_volumes() { # <cid> <cdest> <chost>
         log "    skip volume $vol (excluded media library)"
         continue
       fi
+      if is_network_volume "$vol"; then
+        log "    skip volume $vol (network filesystem)"
+        continue
+      fi
       log "    volume -> $vol"
       if ! docker run --rm --label "$HELPER_LABEL" \
             -v "$vol":/from:ro \
@@ -168,6 +248,10 @@ archive_binds() { # <cid> <cdest> <chost>
       fi
       sbase="$(basename "$src")"
       sdir="$(dirname "$src")"
+      if is_network_bind "$sdir" "$sbase"; then
+        log "    skip bind $src (network filesystem)"
+        continue
+      fi
       # archive name derived from the in-container destination path
       san="$(printf '%s' "$dst" | sed 's#^/##; s#[/ ]#_#g; s#[^A-Za-z0-9._-]#_#g')"
       [ -z "$san" ] && san="root"

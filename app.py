@@ -44,6 +44,7 @@ DEFAULT_HOUR = int(os.environ.get("BACKUP_HOUR", "3"))
 CONFIG_DIR = os.path.join(BACKUP_ROOT, "_config")
 SCHEDULES_PATH = os.path.join(CONFIG_DIR, "schedules.json")
 SETTINGS_PATH = os.path.join(CONFIG_DIR, "settings.json")
+EXCLUSIONS_PATH = os.path.join(CONFIG_DIR, "exclusions.json")  # per-mount keep/skip
 LEGACY_PATH = os.path.join(CONFIG_DIR, "schedule.json")   # pre-redesign single schedule
 LOG_DIR = os.path.join(BACKUP_ROOT, "_logs")
 LOG_PATH = os.path.join(LOG_DIR, "activity.log")
@@ -91,12 +92,13 @@ def run(cmd, timeout=None):
         return 1, str(exc)
 
 
-def run_stream(cmd, on_line, timeout=None):
+def run_stream(cmd, on_line, timeout=None, env=None):
     """Run a command, streaming each output line to on_line as it is produced.
 
     Returns (rc, full_output). Unlike run(), output is delivered live so the
     activity log (and the GUI that polls it) updates while the job is running
-    instead of only at the end.
+    instead of only at the end. ``env`` (when given) replaces the child's
+    environment so callers can pass per-run exclusion variables.
     """
     lines = []
     try:
@@ -104,7 +106,7 @@ def run_stream(cmd, on_line, timeout=None):
         # request can signal the whole tree (backup.sh + any docker clients).
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True, bufsize=1,
-                             start_new_session=True)
+                             start_new_session=True, env=env)
     except Exception as exc:  # noqa: BLE001
         return 1, str(exc)
     with _proc_lock:
@@ -189,7 +191,10 @@ def _safe_subpath(rel):
 
 
 def load_settings():
-    cfg = {"destination": "", "manual_retention": 10}
+    cfg = {"destination": "", "manual_retention": 10,
+           "skip_network_mounts": False,
+           "exclude_bind_patterns": [], "exclude_volume_patterns": [],
+           "include_bind_patterns": [], "include_volume_patterns": []}
     try:
         with open(SETTINGS_PATH, encoding="utf-8") as fh:
             data = json.load(fh)
@@ -197,6 +202,10 @@ def load_settings():
         mr = data.get("manual_retention")
         if isinstance(mr, int) and 1 <= mr <= 999:
             cfg["manual_retention"] = mr
+        cfg["skip_network_mounts"] = bool(data.get("skip_network_mounts", False))
+        for key in ("exclude_bind_patterns", "exclude_volume_patterns",
+                    "include_bind_patterns", "include_volume_patterns"):
+            cfg[key] = _clean_patterns(data.get(key))
     except FileNotFoundError:
         write_json(SETTINGS_PATH, cfg)
     except Exception as exc:  # noqa: BLE001
@@ -206,6 +215,71 @@ def load_settings():
 
 def save_settings(cfg):
     write_json(SETTINGS_PATH, cfg)
+
+
+def _clean_patterns(value):
+    """Accept a list or newline/space string of globs; return a deduped list.
+
+    Patterns may not contain whitespace (each token is a single shell glob) and
+    are capped to keep the exec environment small.
+    """
+    if isinstance(value, str):
+        tokens = value.replace("\r", "\n").replace("\n", " ").split()
+    elif isinstance(value, list):
+        tokens = []
+        for item in value:
+            tokens.extend(str(item).split())
+    else:
+        return []
+    out = []
+    for tok in tokens:
+        tok = tok.strip()
+        if tok and tok not in out:
+            out.append(tok)
+        if len(out) >= 200:
+            break
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# per-mount exclusions  (Mounts tab: keep/skip individual volumes & binds)
+# --------------------------------------------------------------------------- #
+def load_exclusions():
+    """Return {'volumes': {name: 'include'|'exclude'},
+               'binds':   {source: 'include'|'exclude'}}.
+
+    Only mounts the user explicitly overrode are stored; everything absent keeps
+    the default behaviour (back it up unless a global pattern/network rule skips).
+    """
+    data = {"volumes": {}, "binds": {}}
+    try:
+        with open(EXCLUSIONS_PATH, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return data
+    except Exception as exc:  # noqa: BLE001
+        log(f"WARN could not read exclusions: {exc}")
+        return data
+    for kind in ("volumes", "binds"):
+        section = raw.get(kind, {})
+        if isinstance(section, dict):
+            for key, rule in section.items():
+                if isinstance(key, str) and rule in ("include", "exclude"):
+                    data[kind][key] = rule
+    return data
+
+
+def save_exclusions(data):
+    clean = {"volumes": {}, "binds": {}}
+    for kind in ("volumes", "binds"):
+        section = (data or {}).get(kind, {})
+        if isinstance(section, dict):
+            for key, rule in section.items():
+                if isinstance(key, str) and rule in ("include", "exclude"):
+                    clean[kind][key] = rule
+    write_json(EXCLUSIONS_PATH, clean)
+    return clean
+
 
 
 # --------------------------------------------------------------------------- #
@@ -351,6 +425,64 @@ def list_containers():
     return items
 
 
+# Network filesystem types reported by `docker volume inspect` .Options.type.
+_NETWORK_VOL_TYPES = ("nfs", "nfs4", "cifs", "smb", "smb2", "smb3", "smbfs")
+
+
+def _volume_is_network(name):
+    """True if a named volume is backed by an NFS/SMB/CIFS driver option."""
+    if not name:
+        return False
+    rc, out = run(["docker", "volume", "inspect", "-f",
+                   '{{ index .Options "type" }}', name])
+    if rc != 0:
+        return False
+    return out.strip().lower() in _NETWORK_VOL_TYPES
+
+
+def list_mounts():
+    """Enumerate every container's volumes and bind mounts for the Mounts tab.
+
+    Returns one entry per container with its mounts annotated by the user's
+    current keep/skip rule (from exclusions.json). Bind fstype is not probed here
+    (that needs a host helper and would be slow); the global "skip network mounts"
+    toggle handles network binds at backup time instead.
+    """
+    exclusions = load_exclusions()
+    containers = list_containers()
+    result = []
+    for c in containers:
+        name = c["name"]
+        # Tab-separated: type, volume-name, source, destination — one line per mount.
+        rc, out = run(["docker", "inspect", "-f",
+                       '{{range .Mounts}}{{.Type}}\t{{.Name}}\t{{.Source}}\t{{.Destination}}\n{{end}}',
+                       name])
+        if rc != 0:
+            continue
+        mounts = []
+        for ln in out.splitlines():
+            if not ln.strip():
+                continue
+            parts = ln.split("\t")
+            if len(parts) < 4:
+                continue
+            mtype, vname, source, dest = parts[0], parts[1], parts[2], parts[3]
+            if mtype == "volume" and vname:
+                rule = exclusions["volumes"].get(vname, "default")
+                mounts.append({"kind": "volume", "key": vname, "id": vname,
+                               "label": vname, "dest": dest,
+                               "network": _volume_is_network(vname), "rule": rule})
+            elif mtype == "bind" and source:
+                rule = exclusions["binds"].get(source, "default")
+                mounts.append({"kind": "bind", "key": source, "id": source,
+                               "label": source, "dest": dest,
+                               "network": False, "rule": rule})
+        if mounts:
+            result.append({"container": name, "project": c["project"],
+                           "mounts": mounts})
+    return result
+
+
 # --------------------------------------------------------------------------- #
 # backups on disk  (run discovery + filesystem browse)
 # --------------------------------------------------------------------------- #
@@ -474,6 +606,44 @@ def _backup_progress_line(line):
         STATE["step"] = f"{cur} \u00b7 volume {mv.group(1)}" if cur else f"volume {mv.group(1)}"
 
 
+def _backup_env(settings):
+    """Build the child environment for backup.sh from settings + per-mount rules.
+
+    Returns None when nothing is configured (so the child inherits this process'
+    environment unchanged — identical to the tool's original behaviour). Anything
+    we set goes through the EXTRA_* / SKIP_NETWORK_MOUNTS variables, which APPEND
+    to backup.sh's built-in defaults rather than replacing them.
+    """
+    exclusions = load_exclusions()
+    extra_excl_vol = list(settings.get("exclude_volume_patterns", []))
+    extra_excl_bind = list(settings.get("exclude_bind_patterns", []))
+    extra_incl_vol = list(settings.get("include_volume_patterns", []))
+    extra_incl_bind = list(settings.get("include_bind_patterns", []))
+    # Per-mount choices map onto the same EXTRA_* pattern lists, matching a volume
+    # by its exact name and a bind by its exact host source path.
+    for vname, rule in exclusions["volumes"].items():
+        (extra_incl_vol if rule == "include" else extra_excl_vol).append(vname)
+    for source, rule in exclusions["binds"].items():
+        (extra_incl_bind if rule == "include" else extra_excl_bind).append(source)
+
+    overrides = {}
+    if extra_excl_vol:
+        overrides["EXTRA_EXCLUDE_VOLUME_PATTERNS"] = " ".join(extra_excl_vol)
+    if extra_excl_bind:
+        overrides["EXTRA_EXCLUDE_BIND_PATTERNS"] = " ".join(extra_excl_bind)
+    if extra_incl_vol:
+        overrides["EXTRA_INCLUDE_VOLUME_PATTERNS"] = " ".join(extra_incl_vol)
+    if extra_incl_bind:
+        overrides["EXTRA_INCLUDE_BIND_PATTERNS"] = " ".join(extra_incl_bind)
+    if settings.get("skip_network_mounts"):
+        overrides["SKIP_NETWORK_MOUNTS"] = "1"
+    if not overrides:
+        return None
+    env = dict(os.environ)
+    env.update(overrides)
+    return env
+
+
 def do_backup(names, bucket, retention, label, running_only=False):
     settings = load_settings()
     dest = settings["destination"]
@@ -481,6 +651,7 @@ def do_backup(names, bucket, retention, label, running_only=False):
     bucket_rel = "/".join(p for p in (dest, bucket) if p)
     run_subpath = f"{bucket_rel}/{stamp}"
     extra = ["--running"] if running_only and not names else []
+    env = _backup_env(settings)
     # Estimate how many containers this run will touch, for the progress bar.
     if names:
         total = len(names)
@@ -496,7 +667,7 @@ def do_backup(names, bucket, retention, label, running_only=False):
         STATE["step"] = "starting\u2026"
         log(f"Backup started ({label}) -> {run_subpath}")
         rc, out = run_stream(["/usr/local/bin/backup.sh", run_subpath, *extra, *names],
-                             _backup_progress_line, timeout=3600)
+                             _backup_progress_line, timeout=3600, env=env)
         if rc == 0 and retention:
             _prune_bucket(bucket_rel, retention)
         STATE["busy"] = False
@@ -681,6 +852,9 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif path == "/api/containers":
             self._json(list_containers())
+        elif path == "/api/mounts":
+            self._json({"containers": list_mounts(),
+                        "exclusions": load_exclusions()})
         elif path == "/api/runs":
             self._json(list_runs())
         elif path == "/api/schedules":
@@ -727,9 +901,20 @@ class Handler(BaseHTTPRequestHandler):
             mr = body.get("manual_retention")
             if isinstance(mr, int) and 1 <= mr <= 999:
                 cfg["manual_retention"] = mr
+            if "skip_network_mounts" in body:
+                cfg["skip_network_mounts"] = bool(body.get("skip_network_mounts"))
+            for key in ("exclude_bind_patterns", "exclude_volume_patterns",
+                        "include_bind_patterns", "include_volume_patterns"):
+                if key in body:
+                    cfg[key] = _clean_patterns(body.get(key))
             save_settings(cfg)
             log(f"Settings updated: {cfg}")
             self._json({"ok": True, "settings": cfg})
+        elif path == "/api/exclusions":
+            saved = save_exclusions(body)
+            log(f"Mount exclusions updated: "
+                f"{len(saved['volumes'])} volume(s), {len(saved['binds'])} bind(s)")
+            self._json({"ok": True, "exclusions": saved})
         else:
             self._json({"error": "not found"}, 404)
 
@@ -776,6 +961,17 @@ tr:last-child td{border-bottom:none}
 .right{margin-left:auto}
 input[type=text],input[type=number],select{background:var(--panel2);border:1px solid var(--line);
 color:var(--fg);padding:7px 10px;border-radius:7px;font-size:13px}
+textarea{background:var(--panel2);border:1px solid var(--line);color:var(--fg);padding:8px 10px;
+border-radius:7px;font:12px/1.45 ui-monospace,Consolas,monospace;resize:vertical}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}
+.mnt{border:1px solid var(--line);border-radius:9px;padding:12px 14px;margin-bottom:12px;background:var(--panel2)}
+.mnt h3{margin:0 0 8px;font-size:14px}
+.mnt table{width:100%}.mnt td{padding:5px 6px;vertical-align:middle}
+.mnt .path{font:12px/1.4 ui-monospace,Consolas,monospace;word-break:break-all}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}
+.seg button{background:var(--panel);border:none;color:var(--muted);padding:5px 10px;cursor:pointer;font-size:12px}
+.seg button.on{background:var(--accent);color:#fff}
+.seg button.on.skip{background:var(--err)}.seg button.on.keep{background:var(--ok);color:#06210f}
 input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent)}
 label{display:inline-flex;align-items:center;gap:6px}
 .chip{background:var(--panel2);border:1px solid var(--line);border-radius:20px;padding:4px 10px;
@@ -818,6 +1014,7 @@ tr.ctnRow td{background:transparent;color:var(--muted);font-size:12px;border-bot
   <button data-tab="backup" class="active">Backup</button>
   <button data-tab="restore">Restore</button>
   <button data-tab="schedules">Schedules</button>
+  <button data-tab="mounts">Mounts</button>
   <button data-tab="settings">Settings</button>
   <button data-tab="logs">Logs</button>
 </nav>
@@ -860,6 +1057,19 @@ tr.ctnRow td{background:transparent;color:var(--muted);font-size:12px;border-bot
       <div id="scheds" style="margin-top:12px"></div>
     </div>
   </section>
+  <!-- MOUNTS -->
+  <section id="tab-mounts" class="hidden">
+    <div class="card">
+      <div class="row"><h2 style="margin:0">Mounts per container</h2>
+        <div class="right row">
+          <button class="btn sec sm" onclick="loadMounts()">↻ Refresh</button>
+          <button class="btn" onclick="saveExclusions()">Save mount choices</button>
+          <span id="mntSaved" class="tag" style="margin-left:6px"></span>
+        </div></div>
+      <p class="tag" style="margin:6px 0 0">Choose which volumes and bind mounts to back up. <b>Default</b> follows the global pattern/network rules in Settings; <b>Keep</b> always includes a mount (overrides every exclude); <b>Skip</b> always excludes it. Database volumes are kept by default — only skip data you can rebuild (media libraries, caches, downloads).</p>
+      <div id="mounts" style="margin-top:12px">loading…</div>
+    </div>
+  </section>
   <!-- SETTINGS -->
   <section id="tab-settings" class="hidden">
     <div class="card">
@@ -881,6 +1091,36 @@ tr.ctnRow td{background:transparent;color:var(--muted);font-size:12px;border-bot
       </div>
       <button class="btn" onclick="saveSettings()">Save settings</button>
       <span id="setSaved" class="tag" style="margin-left:10px"></span>
+    </div>
+    <div class="card">
+      <h2>Exclusions</h2>
+      <p class="tag" style="margin:0 0 12px">Control what gets backed up across every run. These add to the built-in defaults (which already skip media libraries, the Docker socket and system paths) — they do not replace them. Leave blank to keep current behaviour. Per-container choices live in the <b>Mounts</b> tab and take priority over these patterns.</p>
+      <label class="row" style="margin-bottom:14px;gap:8px">
+        <input type="checkbox" id="setSkipNet">
+        Skip network mounts (NFS / SMB / CIFS) <span class="tag">don't back up data that lives on another server</span>
+      </label>
+      <div class="grid2">
+        <div class="fld" style="display:flex;flex-direction:column;gap:4px">
+          <label>Extra <b>exclude</b> bind patterns <span class="tag">host paths, one glob per line</span></label>
+          <textarea id="setExclBind" rows="4" placeholder="*nas-backup*&#10;*/cache/*" style="width:100%"></textarea>
+        </div>
+        <div class="fld" style="display:flex;flex-direction:column;gap:4px">
+          <label>Extra <b>exclude</b> volume patterns <span class="tag">volume names, one glob per line</span></label>
+          <textarea id="setExclVol" rows="4" placeholder="*_cache&#10;tmp_*" style="width:100%"></textarea>
+        </div>
+        <div class="fld" style="display:flex;flex-direction:column;gap:4px">
+          <label>Force <b>keep</b> bind patterns <span class="tag">overrides every exclude</span></label>
+          <textarea id="setInclBind" rows="4" placeholder="*/important/*" style="width:100%"></textarea>
+        </div>
+        <div class="fld" style="display:flex;flex-direction:column;gap:4px">
+          <label>Force <b>keep</b> volume patterns <span class="tag">overrides every exclude</span></label>
+          <textarea id="setInclVol" rows="4" placeholder="db_*" style="width:100%"></textarea>
+        </div>
+      </div>
+      <div style="margin-top:14px">
+        <button class="btn" onclick="saveSettings()">Save settings</button>
+        <span id="setSaved2" class="tag" style="margin-left:10px"></span>
+      </div>
     </div>
   </section>
   <!-- LOGS -->
@@ -918,8 +1158,9 @@ $$("nav button").forEach(b=>b.onclick=()=>{
   if(cur&&cur.dataset.tab==="schedules"&&b.dataset.tab!=="schedules"&&schAnyDirty()
      &&!confirm("You have unsaved schedule changes. Leave without saving?"))return;
   $$("nav button").forEach(x=>x.classList.remove("active"));b.classList.add("active");
-  ["backup","restore","schedules","settings","logs"].forEach(t=>$("#tab-"+t).classList.toggle("hidden",t!==b.dataset.tab));
+  ["backup","restore","schedules","mounts","settings","logs"].forEach(t=>$("#tab-"+t).classList.toggle("hidden",t!==b.dataset.tab));
   if(b.dataset.tab==="logs")loadLogs();
+  if(b.dataset.tab==="mounts")loadMounts();
 });
 
 /* ---------------- Backup ---------------- */
@@ -1140,12 +1381,76 @@ function renderSettings(){
   $("#setRoot").value=SETTINGS.root||"";
   $("#setDest").value=SETTINGS.destination||"";
   $("#setManualRet").value=SETTINGS.manual_retention||10;
+  $("#setSkipNet").checked=!!SETTINGS.skip_network_mounts;
+  $("#setExclBind").value=(SETTINGS.exclude_bind_patterns||[]).join("\n");
+  $("#setExclVol").value=(SETTINGS.exclude_volume_patterns||[]).join("\n");
+  $("#setInclBind").value=(SETTINGS.include_bind_patterns||[]).join("\n");
+  $("#setInclVol").value=(SETTINGS.include_volume_patterns||[]).join("\n");
 }
+function _lines(id){return $(id).value.split(/[\r\n]+/).map(s=>s.trim()).filter(Boolean)}
 async function saveSettings(){
-  const body={destination:$("#setDest").value,manual_retention:parseInt($("#setManualRet").value)||10};
+  const body={
+    destination:$("#setDest").value,
+    manual_retention:parseInt($("#setManualRet").value)||10,
+    skip_network_mounts:$("#setSkipNet").checked,
+    exclude_bind_patterns:_lines("#setExclBind"),
+    exclude_volume_patterns:_lines("#setExclVol"),
+    include_bind_patterns:_lines("#setInclBind"),
+    include_volume_patterns:_lines("#setInclVol"),
+  };
   try{const r=await api("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},
     body:JSON.stringify(body)});SETTINGS=Object.assign(SETTINGS,r.settings);renderSettings();
-    $("#setSaved").textContent="saved ✔";setTimeout(()=>$("#setSaved").textContent="",2500);
+    ["#setSaved","#setSaved2"].forEach(id=>{$(id).textContent="saved ✔";setTimeout(()=>$(id).textContent="",2500)});
+  }catch(e){toast("Error: "+e.message)}
+}
+
+/* ---------------- Mounts ---------------- */
+let MOUNTS=[], MNT_RULES={volumes:{},binds:{}};
+async function loadMounts(){
+  $("#mounts").textContent="loading…";
+  try{const r=await api("/api/mounts");
+    MOUNTS=r.containers||[];
+    MNT_RULES={volumes:Object.assign({},(r.exclusions||{}).volumes),
+               binds:Object.assign({},(r.exclusions||{}).binds)};
+    renderMounts();
+  }catch(e){$("#mounts").textContent="";toast("Error: "+e.message)}
+}
+function _mntRule(m){
+  const store=m.kind==="volume"?MNT_RULES.volumes:MNT_RULES.binds;
+  return store[m.key]||"default";
+}
+function setMntRule(kind,key,rule){
+  const store=kind==="volume"?MNT_RULES.volumes:MNT_RULES.binds;
+  if(rule==="default")delete store[key];else store[key]=rule;
+  renderMounts();
+}
+function renderMounts(){
+  const box=$("#mounts");
+  if(!MOUNTS.length){box.innerHTML='<p class="tag">No volumes or bind mounts found.</p>';return}
+  box.innerHTML=MOUNTS.map(c=>{
+    const rows=c.mounts.map(m=>{
+      const rule=_mntRule(m);
+      const net=m.network?' <span class="tag">network</span>':"";
+      const kindLbl=m.kind==="volume"?"volume":"bind";
+      const seg=["default","include","exclude"].map(r=>{
+        const on=rule===r?" on"+(r==="include"?" keep":r==="exclude"?" skip":""):"";
+        const lbl=r==="default"?"Default":r==="include"?"Keep":"Skip";
+        return `<button class="${on.trim()}" onclick="setMntRule('${m.kind}','${esc(m.key).replace(/'/g,"\\'")}','${r}')">${lbl}</button>`;
+      }).join("");
+      return `<tr><td class="tag" style="width:54px">${kindLbl}</td>`+
+             `<td class="path">${esc(m.label)}${net}<div class="tag">→ ${esc(m.dest)}</div></td>`+
+             `<td style="width:210px;text-align:right"><span class="seg">${seg}</span></td></tr>`;
+    }).join("");
+    return `<div class="mnt"><h3>${esc(c.container)} <span class="tag">${esc(c.project)}</span></h3>`+
+           `<table>${rows}</table></div>`;
+  }).join("");
+}
+async function saveExclusions(){
+  try{const r=await api("/api/exclusions",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(MNT_RULES)});
+    MNT_RULES={volumes:Object.assign({},r.exclusions.volumes),binds:Object.assign({},r.exclusions.binds)};
+    renderMounts();
+    $("#mntSaved").textContent="saved ✔";setTimeout(()=>$("#mntSaved").textContent="",2500);
   }catch(e){toast("Error: "+e.message)}
 }
 
