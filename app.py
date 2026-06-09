@@ -596,20 +596,28 @@ def _backup_progress_line(line):
         STATE["step"] = f"{cur} \u00b7 volume {mv.group(1)}" if cur else f"volume {mv.group(1)}"
 
 
-def _write_selection_file(names, container_mounts):
+def _write_selection_file(names, container_mounts, skip_network=False):
     """Write a per-container TSV selection file for backup.sh; return its path.
 
     One line per named container: ``<container>\t<skip_network>\t<spec>`` where
     spec is ``*`` (all mounts) or a comma-separated list of mount keys
     (``vol:<name>`` / ``bind:<dest>``). Returns None when there is nothing to
     write (so backup.sh defaults every container to all mounts).
+
+    ``skip_network`` is the run-level (schedule/manual) network-skip default.
+    A container without an explicit per-container ``skip_network`` override
+    inherits this default, so the global toggle is never silently lost when a
+    selection file has to be written for *other* containers. (Bug fix: before
+    this, every unconfigured container was written with ``skip_network=0``,
+    which overrode a run-level ``skip_network=1`` and let huge NFS/SMB volumes
+    get archived.)
     """
     if not names or not container_mounts:
         return None
     lines = []
     for n in names:
         cm = container_mounts.get(n) or {}
-        sn = "1" if cm.get("skip_network") else "0"
+        sn = "1" if cm.get("skip_network", skip_network) else "0"
         if cm.get("all", True):
             spec = "*"
         else:
@@ -639,7 +647,7 @@ def do_backup(names, bucket, retention, label, running_only=False,
     # per-container selection file when specific containers were chosen.
     env = dict(os.environ)
     env["SKIP_NETWORK_MOUNTS"] = "1" if skip_network else "0"
-    sel_path = _write_selection_file(names, container_mounts)
+    sel_path = _write_selection_file(names, container_mounts, skip_network)
     if sel_path:
         env["SELECTION_FILE"] = sel_path
     # Estimate how many containers this run will touch, for the progress bar.
