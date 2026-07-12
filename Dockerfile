@@ -1,4 +1,4 @@
-FROM docker:27-cli
+FROM docker:29-cli
 
 # tzdata: local-time scheduling; coreutils: robust date/ls; python3: web GUI + scheduler.
 # docker-cli-compose: lets restore.sh run `docker compose up -d` to recreate
