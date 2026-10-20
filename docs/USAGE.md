@@ -1,6 +1,14 @@
 # Using the web page
 
-Open **<http://127.0.0.1:8088>**. There are five tabs.
+Open **<http://127.0.0.1:8088>**. Command Center has seven pages in its sidebar.
+
+- **Overview** — live container inventory, retained restore points, saved schedules
+  and the current job state. This page does not save configuration.
+- **Statistics** — real retained-run sizes by completion day, daily completed-run
+  counts, and project byte composition. Filter by period or project. This is a
+  view of files still present on disk, not all historical attempts; durations,
+  failure rates, free disk capacity and restore-test outcomes are not recorded
+  by the existing inventory and are explicitly shown as unavailable.
 
 - **Backup** — back up one container, a group, a few you pick, or everything.
   **Expand any container** to choose exactly which volumes and bind mounts to
@@ -18,6 +26,13 @@ Open **<http://127.0.0.1:8088>**. There are five tabs.
 - **Settings** — the backup folder (auto-read from the tool's `/backups` mount),
   an optional subfolder for new runs, and how many manual backups to keep.
 - **Logs** — live activity log.
+  Search filters the displayed text; **Export displayed log** exports that view.
+
+The Command Center redesign keeps the existing backup scripts, API request
+formats, schedule IDs, scope/mount settings, retention rules and backup folder
+layout. Opening a new dashboard page does not rewrite saved schedules or settings.
+The container image includes the UI assets; rebuild the image when updating from
+source. Do not replace or clear the existing `/backups` mount during an upgrade.
 
 While a backup or restore runs, the header shows a **live progress bar** with a
 `done / total` count and the current item (e.g. `14/24 — webapp · volume

@@ -8,6 +8,13 @@ backups by hand, schedule automatic ones, and restore.
   reinstall, point it at the same folder and every old backup is found again.
 - **Notices new containers on its own** — nothing to set up when you add one.
 - **Backs up stopped containers too** (their data is still saved).
+- **Command Center dashboard** with Overview, Docker backups, Restore, Schedules,
+  Settings, Activity Log and Statistics.
+- **Real backup visualizations** for retained sizes, daily completed-run counts
+  and project composition, plus searchable/exportable logs.
+
+The dashboard upgrade preserves existing backup scripts, schedules, retention
+and restore points. Keep the same backup-folder mount when updating.
 
 > **Safety note:** the tool needs access to Docker so it can back up your
 > containers, so run it only on a computer you trust. The web page is only

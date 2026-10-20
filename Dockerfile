@@ -8,6 +8,7 @@ RUN apk add --no-cache tzdata coreutils python3 docker-cli-compose
 COPY backup.sh /usr/local/bin/backup.sh
 COPY restore.sh /usr/local/bin/restore.sh
 COPY app.py /usr/local/bin/app.py
+COPY assets/command-center.css assets/command-center.js /usr/local/bin/assets/
 RUN chmod +x /usr/local/bin/backup.sh /usr/local/bin/restore.sh /usr/local/bin/app.py \
  && ln -s /usr/local/bin/restore.sh /usr/local/bin/restore \
  && ln -s /usr/local/bin/backup.sh /usr/local/bin/backup

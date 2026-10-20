@@ -1,0 +1,9 @@
+**
+!Dockerfile
+!app.py
+!backup.sh
+!restore.sh
+!assets/
+assets/*
+!assets/command-center.css
+!assets/command-center.js

@@ -21,6 +21,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Validate dashboard and backup compatibility
+        run: |
+          python3 -m unittest discover -s tests -p test_command_center.py -v
+          python3 tests/test_exclusions.py
+          node tests/test_frontend.js
+          node --check assets/command-center.js
+
       - name: Docker meta (tags + labels)
         id: meta
         uses: docker/metadata-action@v5

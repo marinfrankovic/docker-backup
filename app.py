@@ -855,6 +855,16 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path == "/":
             self._send(200, HTML, "text/html; charset=utf-8")
+        elif path in ("/assets/command-center.css", "/assets/command-center.js"):
+            asset = os.path.join(os.path.dirname(__file__), "assets", path.rsplit("/", 1)[1])
+            try:
+                with open(asset, "rb") as fh:
+                    content = fh.read()
+            except OSError:
+                self._json({"error": "UI asset unavailable"}, 404)
+                return
+            ctype = "text/css" if path.endswith(".css") else "text/javascript"
+            self._send(200, content, ctype + "; charset=utf-8")
         elif path == "/api/state":
             self._json({
                 "containers": list_containers(),
@@ -1033,10 +1043,30 @@ tr.ctnRow td{background:transparent;color:var(--muted);font-size:12px;border-bot
 .mexp{color:var(--muted)}.mexp:hover{color:var(--fg)}
 .schctn{display:inline-block;vertical-align:top;margin:0 8px 6px 0}
 .schctn .mntpanel{min-width:280px}
-</style></head>
+</style>
+<link rel="stylesheet" href="/assets/command-center.css">
+</head>
 <body>
+<div class="app-shell">
+<aside class="sidebar">
+  <a class="brand" href="#overview" aria-label="Docker Backup overview"><span class="brand-icon" aria-hidden="true">&#x25C7;</span>Docker Backup</a>
+  <nav aria-label="Main navigation">
+    <div class="nav-label">Workspace</div>
+    <button data-tab="overview" class="active"><span data-icon="overview"></span>Overview</button>
+    <div class="nav-label">Workloads</div>
+    <button data-tab="backup"><span data-icon="docker"></span>Docker backups</button>
+    <div class="nav-label">Manage</div>
+    <button data-tab="restore"><span data-icon="restore"></span>Restore</button>
+    <button data-tab="schedules"><span data-icon="schedules"></span>Schedules</button>
+    <button data-tab="settings"><span data-icon="settings"></span>Settings</button>
+    <button data-tab="logs"><span data-icon="logs"></span>Activity log</button>
+    <button data-tab="statistics"><span data-icon="statistics"></span>Statistics</button>
+  </nav>
+  <div class="sidebar-foot"><div class="nav-label">Connected workspace</div><div class="endpoint"><b id="workspaceHost">Docker host</b><span id="workspaceCount" class="tag">Loading inventory...</span></div><p>Existing backup storage and schedules.<br>No configuration changes on page load.</p></div>
+</aside>
+<div class="workspace">
 <header>
-  <h1>🐳 Docker Backup</h1>
+  <div class="breadcrumb">Workspace <span>/</span> <b id="pageCrumb">Overview</b></div>
   <span id="statusBadge" class="badge idle">idle</span>
   <span id="progText" class="tag"></span>
   <button id="btnStop" class="btn danger sm hidden" onclick="stopJob()">⏹ Stop</button>
@@ -1044,16 +1074,16 @@ tr.ctnRow td{background:transparent;color:var(--muted);font-size:12px;border-bot
   <span class="right tag" id="clock"></span>
 </header>
 <div id="progWrap" class="progwrap hidden"><div id="progBar"></div></div>
-<nav>
-  <button data-tab="backup" class="active">Backup</button>
-  <button data-tab="restore">Restore</button>
-  <button data-tab="schedules">Schedules</button>
-  <button data-tab="settings">Settings</button>
-  <button data-tab="logs">Logs</button>
-</nav>
+<div id="connectionNotice" class="connection-notice hidden" role="alert"></div>
 <main>
+  <div class="page-heading"><div><div class="eyebrow" id="pageEyebrow">Docker workspace</div><h1 id="pageTitle">Backup command center</h1><p id="pageSubtitle">Your container backups, schedules and recovery inventory in one place.</p></div><div id="pageActions" class="row"></div></div>
+  <section id="tab-overview"><div id="overviewContent" aria-live="polite"><div class="card muted">Loading backup inventory...</div></div></section>
+  <section id="tab-statistics" class="hidden">
+    <div class="row statistics-toolbar"><label>Period <select id="statsPeriod"><option value="7">Last 7 days</option><option value="30" selected>Last 30 days</option><option value="0">All retained runs</option></select></label><label>Project <select id="statsProject"><option value="">All projects</option></select></label><span class="tag">Derived from retained backup files, not synthetic data</span></div>
+    <div id="statisticsContent"><div class="card muted">Loading retained-run statistics...</div></div>
+  </section>
   <!-- BACKUP -->
-  <section id="tab-backup">
+  <section id="tab-backup" class="hidden">
     <div class="card">
       <div class="row">
         <h2 style="margin:0">Containers</h2>
@@ -1064,11 +1094,14 @@ tr.ctnRow td{background:transparent;color:var(--muted);font-size:12px;border-bot
         </div>
       </div>
       <p class="tag" style="margin:6px 0 0">Pick containers to back up now. Expand a container to choose <b>which mounts</b> to include — everything needed for a full restore (manifest, databases, compose) is always captured regardless. Per container you can exclude its network (NFS / SMB / CIFS) mounts.</p>
+      <div class="backup-toolbar"><label class="search-label">Search <input type="search" id="containerSearch" placeholder="Stack or container name" autocomplete="off"></label><span id="selectionSummary" class="tag">0 containers selected</span></div>
+      <div class="table-scroll">
       <table>
         <thead><tr><th style="width:34px"><input type="checkbox" id="selAll" onclick="toggleAll(this)"></th>
         <th>Container</th><th>Project</th><th>Mounts</th><th>State</th><th></th></tr></thead>
         <tbody id="ctn"></tbody>
       </table>
+      </div>
     </div>
   </section>
   <!-- RESTORE -->
@@ -1130,10 +1163,14 @@ tr.ctnRow td{background:transparent;color:var(--muted);font-size:12px;border-bot
         <button class="right btn sec sm" onclick="loadLogs()">↻ Refresh</button>
         <label class="row tag"><input type="checkbox" id="autoLog" checked> auto</label>
       </div>
+      <div class="log-toolbar"><label>Filter <input type="search" id="logFilter" placeholder="Search log text"></label><button class="btn sec sm" id="downloadLog">Export displayed log</button><span class="tag">Read-only activity history</span></div>
       <pre id="log">loading…</pre>
     </div>
   </section>
 </main>
+<footer class="app-footer"><span>Docker Backup / Command Center</span><span id="dataUpdated">Waiting for server data</span></footer>
+</div>
+</div>
 <div id="toast" class="toast"></div>
 <script>
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
@@ -1141,6 +1178,7 @@ let CT=[], SCHEDS=[], SETTINGS={}, WD=["Mon","Tue","Wed","Thu","Fri","Sat","Sun"
 let MNT={};            // container name -> [ {kind,mkey,label,dest,network} ]
 let BK_EXP=new Set();  // backup tab: containers whose mount panel is expanded
 let BK_SEL=new Set();  // backup tab: containers ticked for backup
+let BK_MOUNTS={};
 let GRP_OPEN=new Set();// backup tab: expanded project groups
 let SCH_COLLAPSED=new Set();
 let SCH_MEXP=new Set();  // schedules: "<schedId>|<container>" with mount panel open
@@ -1157,15 +1195,22 @@ function fmtTime(ts){const n=new Date(ts*1000);return _p2(n.getHours())+":"+_p2(
 function toast(m){const t=$("#toast");t.textContent=m;t.classList.add("show");clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove("show"),3500)}
 async function api(path,opts){const r=await fetch(path,opts);let j={};try{j=await r.json()}catch(e){}if(!r.ok)throw new Error(j.error||j.message||r.status);return j}
 
-$$("nav button").forEach(b=>b.onclick=()=>{
+const TABS=["overview","backup","restore","schedules","settings","logs","statistics"];
+function switchTab(tab){
+  if(!TABS.includes(tab))return;
   const cur=$$("nav button").find(x=>x.classList.contains("active"));
-  if(cur&&cur.dataset.tab==="schedules"&&b.dataset.tab!=="schedules"&&schAnyDirty()
-     &&!confirm("You have unsaved schedule changes. Leave without saving?"))return;
-  $$("nav button").forEach(x=>x.classList.remove("active"));b.classList.add("active");
-  ["backup","restore","schedules","settings","logs"].forEach(t=>$("#tab-"+t).classList.toggle("hidden",t!==b.dataset.tab));
-  if(b.dataset.tab==="logs")loadLogs();
-  if(b.dataset.tab==="settings")loadSelfMounts();
-});
+  if(cur&&cur.dataset.tab==="schedules"&&tab!=="schedules"&&schAnyDirty()
+     &&!confirm("You have unsaved schedule changes. Leave without saving?")){
+    history.replaceState(null,"","#schedules");return;
+  }
+  $$("nav button[data-tab]").forEach(x=>{x.classList.toggle("active",x.dataset.tab===tab);if(x.dataset.tab===tab)x.setAttribute("aria-current","page");else x.removeAttribute("aria-current")});
+  TABS.forEach(t=>$("#tab-"+t).classList.toggle("hidden",t!==tab));
+  history.replaceState(null,"","#"+tab);
+  if(tab==="logs")loadLogs();
+  if(tab==="settings")loadSelfMounts();
+  window.dispatchEvent(new CustomEvent("backup:tab",{detail:tab}));
+}
+$$("nav button[data-tab]").forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
 
 /* ---------------- Backup ---------------- */
 function _q(s){return String(s).replace(/'/g,"\\'")}
@@ -1178,23 +1223,36 @@ function mountSummary(name){
 }
 function bkPanel(name){
   const ms=MNT[name];
+  const choice=BK_MOUNTS[name]||{all:true,mounts:[],skip_network:false};
   const head=`<div class="row" style="margin-bottom:8px;gap:8px">
       <span class=tag>Mounts to back up</span>
       <button class="btn sec sm" onclick="bkAllMounts('${_q(name)}',true)">All</button>
       <button class="btn sec sm" onclick="bkAllMounts('${_q(name)}',false)">None</button>
-      <label class="chip"><input type=checkbox class="bks" data-c="${esc(name)}"> exclude network (NFS/SMB/CIFS)</label>
+      <label class="chip"><input type=checkbox class="bks" data-c="${esc(name)}" ${choice.skip_network?'checked':''}> exclude network (NFS/SMB/CIFS)</label>
     </div>`;
   if(ms===undefined)return `<div class="mntpanel">${head}<div class=tag>loading mounts…</div></div>`;
   if(!ms.length)return `<div class="mntpanel">${head}<div class=tag>No volumes or bind mounts — only the container manifest/compose are captured.</div></div>`;
   const rows=ms.map(m=>{
     const net=m.network?' <span class="tag">network</span>':'';
-    return `<label class="mntopt"><input type=checkbox class="bkm" data-c="${esc(name)}" data-mkey="${esc(m.mkey)}" checked>
+    return `<label class="mntopt"><input type=checkbox class="bkm" data-c="${esc(name)}" data-mkey="${esc(m.mkey)}" ${choice.all||choice.mounts.includes(m.mkey)?'checked':''}>
       <span class="mlbl"><b>${esc(m.kind)}</b> ${esc(m.label)}${net}<span class="tag"> → ${esc(m.dest)}</span></span></label>`;
   }).join("");
   return `<div class="mntpanel">${head}${rows}</div>`;
 }
 function bkAllMounts(name,on){$$('.bkm[data-c="'+CSS.escape(name)+'"]').forEach(x=>x.checked=on)}
+function rememberBackupMounts(){
+  $$(".bks").forEach(skip=>{
+    const boxes=$$('.bkm[data-c="'+CSS.escape(skip.dataset.c)+'"]');
+    const checked=boxes.filter(box=>box.checked).map(box=>box.dataset.mkey);
+    const previous=BK_MOUNTS[skip.dataset.c];
+    BK_MOUNTS[skip.dataset.c]={
+      all:boxes.length?checked.length===boxes.length:(previous?.all??true),
+      mounts:boxes.length?checked:(previous?.mounts||[]),skip_network:skip.checked
+    };
+  });
+}
 function renderContainers(){
+  rememberBackupMounts();
   const tb=$("#ctn");tb.innerHTML="";
   if(!CT.length){tb.innerHTML='<tr><td colspan=6 class=muted>No containers found.</td></tr>';return}
   const groups={};CT.forEach(c=>{(groups[c.project]=groups[c.project]||[]).push(c)});
@@ -1228,6 +1286,7 @@ function renderContainers(){
     });
   });
   syncStates();
+  window.dispatchEvent(new Event("backup:containers"));
 }
 function bkSel(name,on){if(on)BK_SEL.add(name);else BK_SEL.delete(name);syncStates()}
 function bkToggle(name){if(BK_EXP.has(name))BK_EXP.delete(name);else BK_EXP.add(name);renderContainers()}
@@ -1242,6 +1301,7 @@ function syncStates(){
   });
   const all=$$(".csel"),sel=$("#selAll");
   if(sel)sel.checked=all.length>0&&[...all].every(x=>x.checked);
+  const summary=$("#selectionSummary");if(summary)summary.textContent=BK_SEL.size+" containers selected";
 }
 function toggleCollapse(gid){if(GRP_OPEN.has(gid))GRP_OPEN.delete(gid);else GRP_OPEN.add(gid);renderContainers()}
 function backupProject(proj){const names=CT.filter(c=>c.project===proj).map(c=>c.name);if(!names.length)return;backupNames(names)}
@@ -1547,6 +1607,7 @@ function setStatus(s){
     if(bs)bs.classList.add("hidden");
   }
   ["btnBackupSel","btnBackupAll"].forEach(id=>{const e=$("#"+id);if(e)e.disabled=s.busy});
+  window.dispatchEvent(new CustomEvent("backup:state",{detail:s}));
 }
 async function refresh(){
   try{const s=await api("/api/state");
@@ -1557,12 +1618,14 @@ async function refresh(){
     $("#rootTag").textContent="root: "+s.root;
     renderContainers();renderRuns(s.runs);renderSchedules();renderSettings();setStatus(s);
     loadAllMounts();
-  }catch(e){toast("Error: "+e.message)}
+  }catch(e){toast("Error: "+e.message);window.dispatchEvent(new CustomEvent("backup:error",{detail:e.message}))}
 }
 async function loadLogs(){
   try{const r=await api("/api/logs");const el=$("#log");
+    window.dispatchEvent(new CustomEvent("backup:logs",{detail:r.lines}));
     el.textContent=r.lines.join("")||"(empty)";el.scrollTop=el.scrollHeight;
-  }catch(e){}
+    window.dispatchEvent(new Event("backup:log-rendered"));
+  }catch(e){toast("Error loading logs: "+e.message)}
 }
 window.addEventListener("beforeunload",e=>{if(schAnyDirty()){e.preventDefault();e.returnValue=""}});
 setInterval(()=>{const n=new Date();const p=x=>String(x).padStart(2,"0");
@@ -1574,10 +1637,11 @@ setInterval(async()=>{try{const s=await api("/api/state");setStatus(s);
   // when a backup/restore finishes, refresh the Restore list in the background
   if(_wasBusy&&!s.busy){renderRuns(s.runs);}
   _wasBusy=!!s.busy;
-}catch(e){}},2000);
+}catch(e){window.dispatchEvent(new CustomEvent("backup:error",{detail:e.message}))}},2000);
 setInterval(()=>{if($("#autoLog")?.checked && !$("#tab-logs").classList.contains("hidden"))loadLogs()},5000);
 refresh();
 </script>
+<script src="/assets/command-center.js"></script>
 </body></html>
 """
 
